@@ -2,6 +2,7 @@
  *
  * ----------------------------------------------------------------------------
  *
+ * Copyright (c) 2018, Intel Corporation
  * Copyright (c) 2009-2016, Salvatore Sanfilippo <antirez at gmail dot com>
  * All rights reserved.
  *
@@ -34,6 +35,9 @@
 #include "bio.h"
 #include "atomicvar.h"
 
+#ifdef USE_NVM
+#include "nvm.h"
+#endif
 /* ----------------------------------------------------------------------------
  * Data structures
  * --------------------------------------------------------------------------*/
@@ -166,10 +170,14 @@ void evictionPoolPopulate(int dbid, dict *sampledict, dict *keydict, struct evic
     dictEntry *samples[server.maxmemory_samples];
 
     count = dictGetSomeKeys(sampledict,samples,server.maxmemory_samples);
+#ifdef USE_NVM
+    bool mv_nvm_done = 0;
+#endif
+
     for (j = 0; j < count; j++) {
         unsigned long long idle;
         sds key;
-        robj *o;
+        robj *o=NULL;
         dictEntry *de;
 
         de = samples[j];
@@ -204,6 +212,20 @@ void evictionPoolPopulate(int dbid, dict *sampledict, dict *keydict, struct evic
             serverPanic("Unknown eviction policy in evictionPoolPopulate()");
         }
 
+
+#ifdef USE_NVM
+        /* move value back to AEP if needed */
+        if(!mv_nvm_done){
+            if (o && o->need_mv_to_nvm)
+            {
+                o->ptr = sdsmvtonvm(o->ptr);
+                if (is_nvm_addr(o->ptr)) {
+                    o->need_mv_to_nvm = 0;
+                    mv_nvm_done = 1;
+                }
+            }
+        }
+#endif
         /* Insert the element inside the pool.
          * First, find the first empty bucket or the first populated
          * bucket that has an idle time smaller than our idle time. */

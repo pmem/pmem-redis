@@ -1,5 +1,6 @@
 /* quicklist.c - A doubly linked list of ziplists
  *
+ * Copyright (c) 2018, Intel Corporation
  * Copyright (c) 2014, Matt Stancliff <matt@genges.com>
  * All rights reserved.
  *
@@ -27,6 +28,7 @@
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  */
+#include "server.h"
 
 #include <string.h> /* for memcpy */
 #include "quicklist.h"
@@ -34,6 +36,12 @@
 #include "ziplist.h"
 #include "util.h" /* for ll2string */
 #include "lzf.h"
+
+#ifdef USE_NVM
+#include <assert.h>
+#include "libpmem.h"
+#include "nvm.h"
+#endif
 
 #if defined(REDIS_TEST) || defined(REDIS_TEST_VERBOSE)
 #include <stdio.h> /* for printf (debug printing), snprintf (genstr) */
@@ -161,7 +169,14 @@ void quicklistRelease(quicklist *quicklist) {
     while (len--) {
         next = current->next;
 
+#ifdef USE_NVM
+        if(current->encoding == QUICKLIST_NODE_ENCODING_RAW)
+            ziplistFree(current->zl);
+        else
+            zfree(current->zl);
+#else
         zfree(current->zl);
+#endif
         quicklist->count -= current->count;
 
         zfree(current);
@@ -186,6 +201,11 @@ REDIS_STATIC int __quicklistCompressNode(quicklistNode *node) {
 
     quicklistLZF *lzf = zmalloc(sizeof(*lzf) + node->sz);
 
+#ifdef USE_NVM
+    node->zl = ziplistNVMEntryDecode(node->zl);
+    node->sz = ziplistBlobLen((unsigned char*)node->zl);
+#endif
+
     /* Cancel if compression fails or doesn't compress small enough */
     if (((lzf->sz = lzf_compress(node->zl, node->sz, lzf->compressed,
                                  node->sz)) == 0) ||
@@ -195,6 +215,17 @@ REDIS_STATIC int __quicklistCompressNode(quicklistNode *node) {
         return 0;
     }
     lzf = zrealloc(lzf, sizeof(*lzf) + lzf->sz);
+#ifdef USE_NVM
+    /* if ziplist node is compressed, only move compressed node from DDR to NVM. */
+    if (lzf && sizeof(*lzf) + lzf->sz >= server.sdsmv_threshold && getpid() == server.pid) {
+        quicklistLZF *lzf_nvm = nvm_malloc(sizeof(*lzf) + lzf->sz);
+        if (lzf_nvm) {
+            pmem_memcpy_persist(lzf_nvm, lzf, sizeof(*lzf) + lzf->sz);
+            zfree(lzf);
+            lzf = lzf_nvm;
+        }
+    }
+#endif
     zfree(node->zl);
     node->zl = (unsigned char *)lzf;
     node->encoding = QUICKLIST_NODE_ENCODING_LZF;
@@ -266,8 +297,22 @@ REDIS_STATIC void __quicklistCompress(const quicklist *quicklist,
                                       quicklistNode *node) {
     /* If length is less than our compress depth (from both sides),
      * we can't compress anything. */
-    if (!quicklistAllowsCompression(quicklist) ||
-        quicklist->len < (unsigned int)(quicklist->compress * 2))
+    if (!quicklistAllowsCompression(quicklist)) {
+#ifdef USE_NVM
+        /* if list-compress-depth is 0, move raw ziplist node from DDR to NVM. */
+        if (node && node->sz >= server.sdsmv_threshold && getpid() == server.pid) {
+            unsigned char *zl_nvm = nvm_malloc(node->sz);
+            if(zl_nvm) {
+                pmem_memcpy_persist(zl_nvm, node->zl, node->sz);
+                zfree(node->zl);
+                node->zl = zl_nvm;
+            }
+        }
+#endif
+        return;
+    }
+
+    if ( quicklist->len < (unsigned int)(quicklist->compress * 2))
         return;
 
 #if 0
@@ -479,8 +524,10 @@ REDIS_STATIC int _quicklistNodeAllowMerge(const quicklistNode *a,
  * Returns 1 if new head created. */
 int quicklistPushHead(quicklist *quicklist, void *value, size_t sz) {
     quicklistNode *orig_head = quicklist->head;
-    if (likely(
-            _quicklistNodeAllowInsert(quicklist->head, quicklist->fill, sz))) {
+    if (likely(_quicklistNodeAllowInsert(quicklist->head, quicklist->fill, sz))) {
+#ifdef AEP_COW
+        quicklist->head->zl=redisduplicatenvmaddr(quicklist->head->zl);
+#endif
         quicklist->head->zl =
             ziplistPush(quicklist->head->zl, value, sz, ZIPLIST_HEAD);
         quicklistNodeUpdateSz(quicklist->head);
@@ -504,6 +551,10 @@ int quicklistPushTail(quicklist *quicklist, void *value, size_t sz) {
     quicklistNode *orig_tail = quicklist->tail;
     if (likely(
             _quicklistNodeAllowInsert(quicklist->tail, quicklist->fill, sz))) {
+#ifdef AEP_COW
+        quicklist->tail->zl=redisduplicatenvmaddr(quicklist->tail->zl);
+#endif
+            
         quicklist->tail->zl =
             ziplistPush(quicklist->tail->zl, value, sz, ZIPLIST_TAIL);
         quicklistNodeUpdateSz(quicklist->tail);
@@ -518,6 +569,7 @@ int quicklistPushTail(quicklist *quicklist, void *value, size_t sz) {
     quicklist->tail->count++;
     return (orig_tail != quicklist->tail);
 }
+
 
 /* Create new node consisting of a pre-formed ziplist.
  * Used for loading RDBs where entire ziplists have been stored
@@ -592,12 +644,14 @@ REDIS_STATIC void __quicklistDelNode(quicklist *quicklist,
     }
 
     /* If we deleted a node within our compress depth, we
-     * now have compressed nodes needing to be decompressed. */
+    * now have compressed nodes needing to be decompressed. */
     __quicklistCompress(quicklist, NULL);
 
     quicklist->count -= node->count;
 
-    zfree(node->zl);
+    if(node->zl) {
+        zfree(node->zl);
+    }
     zfree(node);
     quicklist->len--;
 }
@@ -614,6 +668,9 @@ REDIS_STATIC int quicklistDelIndex(quicklist *quicklist, quicklistNode *node,
                                    unsigned char **p) {
     int gone = 0;
 
+#ifdef AEP_COW
+    node->zl=redisduplicatenvmaddr(node->zl);
+#endif
     node->zl = ziplistDelete(node->zl, p);
     node->count--;
     if (node->count == 0) {
@@ -626,6 +683,7 @@ REDIS_STATIC int quicklistDelIndex(quicklist *quicklist, quicklistNode *node,
     /* If we deleted the node, the original node is no longer valid */
     return gone ? 1 : 0;
 }
+
 
 /* Delete one element represented by 'entry'
  *
@@ -664,11 +722,13 @@ void quicklistDelEntry(quicklistIter *iter, quicklistEntry *entry) {
  *
  * Returns 1 if replace happened.
  * Returns 0 if replace failed and no changes happened. */
-int quicklistReplaceAtIndex(quicklist *quicklist, long index, void *data,
+int quicklistReplaceAtIndex( quicklist *quicklist, long index, void *data,
                             int sz) {
     quicklistEntry entry;
     if (likely(quicklistIndex(quicklist, index, &entry))) {
-        /* quicklistIndex provides an uncompressed node */
+#ifdef AEP_COW
+        entry.node->zl=redisduplicatenvmaddr(entry.node->zl);
+#endif
         entry.node->zl = ziplistDelete(entry.node->zl, &entry.zi);
         entry.node->zl = ziplistInsert(entry.node->zl, entry.zi, data, sz);
         quicklistNodeUpdateSz(entry.node);
@@ -678,6 +738,7 @@ int quicklistReplaceAtIndex(quicklist *quicklist, long index, void *data,
         return 0;
     }
 }
+
 
 /* Given two nodes, try to merge their ziplists.
  *
@@ -813,11 +874,19 @@ REDIS_STATIC quicklistNode *_quicklistSplitNode(quicklistNode *node, int offset,
     D("After %d (%d); ranges: [%d, %d], [%d, %d]", after, offset, orig_start,
       orig_extent, new_start, new_extent);
 
+#ifdef USE_NVM
+    node->zl = ziplistDeleteRangeNoFreeNVM(node->zl, orig_start, orig_extent);
+#else
     node->zl = ziplistDeleteRange(node->zl, orig_start, orig_extent);
+#endif
     node->count = ziplistLen(node->zl);
     quicklistNodeUpdateSz(node);
 
+#ifdef USE_NVM
+    new_node->zl = ziplistDeleteRangeNoFreeNVM(new_node->zl, new_start, new_extent);
+#else
     new_node->zl = ziplistDeleteRange(new_node->zl, new_start, new_extent);
+#endif
     new_node->count = ziplistLen(new_node->zl);
     quicklistNodeUpdateSz(new_node);
 
@@ -877,6 +946,10 @@ REDIS_STATIC void _quicklistInsert(quicklist *quicklist, quicklistEntry *entry,
         D("Not full, inserting after current position.");
         quicklistDecompressNodeForUse(node);
         unsigned char *next = ziplistNext(node->zl, entry->zi);
+#ifdef AEP_COW
+        node->zl=redisduplicatenvmaddr(node->zl);
+#endif
+
         if (next == NULL) {
             node->zl = ziplistPush(node->zl, value, sz, ZIPLIST_TAIL);
         } else {
@@ -888,6 +961,10 @@ REDIS_STATIC void _quicklistInsert(quicklist *quicklist, quicklistEntry *entry,
     } else if (!full && !after) {
         D("Not full, inserting before current position.");
         quicklistDecompressNodeForUse(node);
+#ifdef AEP_COW
+        node->zl=redisduplicatenvmaddr(node->zl);
+#endif
+
         node->zl = ziplistInsert(node->zl, entry->zi, value, sz);
         node->count++;
         quicklistNodeUpdateSz(node);
@@ -898,6 +975,9 @@ REDIS_STATIC void _quicklistInsert(quicklist *quicklist, quicklistEntry *entry,
         D("Full and tail, but next isn't full; inserting next node head");
         new_node = node->next;
         quicklistDecompressNodeForUse(new_node);
+#ifdef AEP_COW
+        node->zl=redisduplicatenvmaddr(node->zl);
+#endif
         new_node->zl = ziplistPush(new_node->zl, value, sz, ZIPLIST_HEAD);
         new_node->count++;
         quicklistNodeUpdateSz(new_node);
@@ -908,6 +988,9 @@ REDIS_STATIC void _quicklistInsert(quicklist *quicklist, quicklistEntry *entry,
         D("Full and head, but prev isn't full, inserting prev node tail");
         new_node = node->prev;
         quicklistDecompressNodeForUse(new_node);
+#ifdef AEP_COW
+        new_node->zl=redisduplicatenvmaddr(new_node->zl);
+#endif
         new_node->zl = ziplistPush(new_node->zl, value, sz, ZIPLIST_TAIL);
         new_node->count++;
         quicklistNodeUpdateSz(new_node);
@@ -928,6 +1011,9 @@ REDIS_STATIC void _quicklistInsert(quicklist *quicklist, quicklistEntry *entry,
         D("\tsplitting node...");
         quicklistDecompressNodeForUse(node);
         new_node = _quicklistSplitNode(node, entry->offset, after);
+#ifdef AEP_COW
+        new_node->zl=redisduplicatenvmaddr(new_node->zl);
+#endif   
         new_node->zl = ziplistPush(new_node->zl, value, sz,
                                    after ? ZIPLIST_HEAD : ZIPLIST_TAIL);
         new_node->count++;
@@ -949,12 +1035,7 @@ void quicklistInsertAfter(quicklist *quicklist, quicklistEntry *entry,
     _quicklistInsert(quicklist, entry, value, sz, 1);
 }
 
-/* Delete a range of elements from the quicklist.
- *
- * elements may span across multiple quicklistNodes, so we
- * have to be careful about tracking where we start and end.
- *
- * Returns 1 if entries were deleted, 0 if nothing was deleted. */
+
 int quicklistDelRange(quicklist *quicklist, const long start,
                       const long count) {
     if (count <= 0)
@@ -1020,6 +1101,9 @@ int quicklistDelRange(quicklist *quicklist, const long start,
             __quicklistDelNode(quicklist, node);
         } else {
             quicklistDecompressNodeForUse(node);
+#ifdef AEP_COW
+            node->zl=redisduplicatenvmaddr(node->zl);
+#endif       
             node->zl = ziplistDeleteRange(node->zl, entry.offset, del);
             quicklistNodeUpdateSz(node);
             node->count -= del;
@@ -1349,6 +1433,10 @@ int quicklistPopCustom(quicklist *quicklist, int where, unsigned char **data,
         return 0;
     }
 
+#ifdef AEP_COW
+    node->zl=redisduplicatenvmaddr(node->zl);
+#endif
+
     p = ziplistIndex(node->zl, pos);
     if (ziplistGet(p, &vstr, &vlen, &vlong)) {
         if (vstr) {
@@ -1367,6 +1455,7 @@ int quicklistPopCustom(quicklist *quicklist, int where, unsigned char **data,
     }
     return 0;
 }
+
 
 /* Return a malloc'd copy of data passed in */
 REDIS_STATIC void *_quicklistSaver(unsigned char *data, unsigned int sz) {

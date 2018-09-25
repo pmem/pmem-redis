@@ -18,7 +18,7 @@
 /jemalloc.pc
 
 /lib/
-
+/obj/
 /Makefile
 
 /include/jemalloc/internal/jemalloc_internal.h

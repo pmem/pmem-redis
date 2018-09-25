@@ -3,7 +3,6 @@ start_server {tags {"aofrw"}} {
     r config set appendonly yes
     r config set auto-aof-rewrite-percentage 0 ; # Disable auto-rewrite.
     waitForBgrewriteaof r
-
     foreach rdbpre {yes no} {
         r config set aof-use-rdb-preamble $rdbpre
         test "AOF rewrite during write load: RDB preamble=$rdbpre" {

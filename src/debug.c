@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2018, Intel Corporation
  * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
  * All rights reserved.
  *
@@ -285,6 +286,8 @@ void debugCommand(client *c) {
         blen++; addReplyStatus(c,
         "reload   -- Save the RDB on disk and reload it back in memory.");
         blen++; addReplyStatus(c,
+        "loadrdb   -- reload rdb back in memory.");
+        blen++; addReplyStatus(c,
         "loadaof  -- Flush the AOF buffers on disk and reload the AOF in memory.");
         blen++; addReplyStatus(c,
         "object <key> -- Show low level info about key and associated value.");
@@ -346,7 +349,15 @@ void debugCommand(client *c) {
         }
         serverLog(LL_WARNING,"DB reloaded by DEBUG RELOAD");
         addReply(c,shared.ok);
-    } else if (!strcasecmp(c->argv[1]->ptr,"loadaof")) {
+    } else if (!strcasecmp(c->argv[1]->ptr,"loadrdb")) {
+        emptyDb(-1,EMPTYDB_NO_FLAGS,NULL);
+        if (rdbLoad(server.rdb_filename,NULL) != C_OK) {
+            addReplyError(c,"Error trying to load the RDB dump");
+            return;
+        }
+        serverLog(LL_WARNING,"DB reloaded by DEBUG RELOAD");
+        addReply(c,shared.ok);
+    }else if (!strcasecmp(c->argv[1]->ptr,"loadaof")) {
         if (server.aof_state == AOF_ON) flushAppendOnlyFile(1);
         emptyDb(-1,EMPTYDB_NO_FLAGS,NULL);
         if (loadAppendOnlyFile(server.aof_filename) != C_OK) {
@@ -547,7 +558,23 @@ void debugCommand(client *c) {
         stats = sdscat(stats,buf);
 
         addReplyBulkSds(c,stats);
-    } else {
+    }
+#ifdef SUPPORT_PBA
+    else if(strcasecmp(c->argv[1]->ptr, "defrag") == 0 && c->argc == 3)
+    {
+        dictEntry* entry = dictFind(c->db->dict, c->argv[2]->ptr);
+        if(!entry)
+        {
+            addReply(c, shared.nokeyerr);
+            return;
+        }
+        server.pba.defrag_debug = 1;
+        int defragged = defragKey(c->db, entry);
+        server.pba.defrag_debug = 0;
+        addReplyLongLong(c, defragged);
+    }
+#endif
+    else {
         addReplyErrorFormat(c, "Unknown DEBUG subcommand or wrong number of arguments for '%s'",
             (char*)c->argv[1]->ptr);
     }

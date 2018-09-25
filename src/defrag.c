@@ -5,6 +5,7 @@
  * We do that by scanning the keyspace and for each pointer we have, we can try to
  * ask the allocator if moving it to a new address will help reduce fragmentation.
  *
+ * Copyright (c) 2018, Intel Corporation
  * Copyright (c) 2017, Oran Agra
  * Copyright (c) 2017, Redis Labs, Inc
  * All rights reserved.
@@ -41,6 +42,13 @@
 
 #ifdef HAVE_DEFRAG
 
+#ifdef USE_NVM
+#include "libpmem.h"
+#include "nvm.h"
+#include <memkind.h>
+#include <memkind/internal/memkind_pmem.h>
+#endif
+
 /* this method was added to jemalloc in order to help us understand which
  * pointers are worthwhile moving and which aren't */
 int je_get_defrag_hint(void* ptr, int *bin_util, int *run_util);
@@ -54,10 +62,27 @@ void* activeDefragAlloc(void *ptr) {
     int bin_util, run_util;
     size_t size;
     void *newptr;
-    if(!je_get_defrag_hint(ptr, &bin_util, &run_util)) {
-        server.stat_active_defrag_misses++;
-        return NULL;
+
+#ifdef SUPPORT_PBA
+    if(server.pba.defrag_debug)
+        goto defrag_debug;
+#endif
+
+#ifdef USE_NVM
+    if(is_nvm_addr(ptr)) {
+        if(!jemk_get_defrag_hint(ptr, &bin_util, &run_util)) {
+            server.stat_active_defrag_misses++;
+            return NULL;
+        }
+    }else {
+#endif
+	if(!je_get_defrag_hint(ptr, &bin_util, &run_util)) {
+            server.stat_active_defrag_misses++;
+            return NULL;
+	}
+#ifdef USE_NVM
     }
+#endif
     /* if this run is more utilized than the average utilization in this bin
      * (or it is full), skip it. This will eventually move all the allocations
      * from relatively empty runs into relatively full runs. */
@@ -65,13 +90,38 @@ void* activeDefragAlloc(void *ptr) {
         server.stat_active_defrag_misses++;
         return NULL;
     }
+
+#ifdef SUPPORT_PBA
+defrag_debug:
+#endif
+
     /* move this allocation to a new allocation.
      * make sure not to use the thread cache. so that we don't get back the same
      * pointers we try to free */
-    size = zmalloc_size(ptr);
-    newptr = zmalloc_no_tcache(size);
-    memcpy(newptr, ptr, size);
-    zfree_no_tcache(ptr);
+#ifdef USE_NVM
+    if(is_nvm_addr(ptr)) {
+        size=jemk_malloc_usable_size(ptr);
+        newptr=zmalloc_nvm_no_tcache(size);
+        /*printf("dennis... nvm_malloc=%p,dennis=%p\n",newptr,dennis);*/
+        if(newptr) {
+            pmem_memcpy_persist(newptr, ptr, size);
+            zfree_nvm_no_tcache(ptr);
+        }else {
+            newptr=ptr;
+        }
+    }else {
+#endif
+        size = zmalloc_size(ptr);
+        newptr = zmalloc_no_tcache(size);
+        if(newptr) {
+            memcpy(newptr, ptr, size);
+            zfree_no_tcache(ptr);
+        }else {
+           newptr=ptr;
+        }
+#ifdef USE_NVM
+    }
+#endif
     return newptr;
 }
 
@@ -109,6 +159,7 @@ robj *activeDefragStringOb(robj* ob, int *defragged) {
         }
     }
 
+#ifndef SUPPORT_PBA
     /* try to defrag string object */
     if (ob->type == OBJ_STRING) {
         if(ob->encoding==OBJ_ENCODING_RAW) {
@@ -129,6 +180,8 @@ robj *activeDefragStringOb(robj* ob, int *defragged) {
             serverPanic("Unknown string encoding");
         }
     }
+#endif
+
     return ret;
 }
 
@@ -269,6 +322,299 @@ dictEntry* replaceSateliteDictKeyPtrAndOrDefragDictEntry(dict *d, sds oldkey, sd
     return NULL;
 }
 
+#ifdef SUPPORT_PBA
+void defragStringPBA(int db_id, robj* key, sds old_val, sds new_val)
+{
+    serverAssert(is_nvm_addr(old_val) == is_nvm_addr(new_val));
+    if(IS_PBA() && is_nvm_addr(new_val))
+    {
+        robj* argv[3];
+        argv[0] = createStringObject("SET", 3);
+        argv[1] = key;
+        argv[2] = createObject(OBJ_STRING, new_val);
+        argv[2]->no_free_val = 1;
+        feedAppendOnlyFile(server.pba.setCommand, db_id, argv, 3);
+        decrRefCount(argv[0]);
+        decrRefCount(argv[2]);
+    }
+}
+
+void defragSetPBA(int db_id, robj* key, sds old_ele, sds new_ele)
+{
+    serverAssert(is_nvm_addr(old_ele) == is_nvm_addr(new_ele));
+    if(IS_PBA() && is_nvm_addr(new_ele))
+    {
+        robj* argv[3];
+        argv[0] = createStringObject("SREM", 4);
+        argv[1] = key;
+        argv[2] = createObject(OBJ_STRING, old_ele);
+        argv[2]->no_free_val = 1;
+        feedAppendOnlyFile(server.sremCommand, db_id, argv, 3);
+        decrRefCount(argv[0]);
+        decrRefCount(argv[2]);
+        argv[0] = createStringObject("SADD", 4);
+        argv[2] = createObject(OBJ_STRING, new_ele);
+        argv[2]->no_free_val = 1;
+        feedAppendOnlyFile(server.pba.saddCommand, db_id, argv, 3);
+        decrRefCount(argv[0]);
+        decrRefCount(argv[2]);
+    }
+}
+
+void defragZsetPBA(int db_id, robj* key, sds old_ele, sds new_ele, double score)
+{
+    serverAssert(is_nvm_addr(old_ele) == is_nvm_addr(new_ele));
+    if(IS_PBA() && is_nvm_addr(new_ele))
+    {
+        robj* argv[4];
+        argv[0] = createStringObject("ZREM", 4);
+        argv[1] = key;
+        argv[2] = createObject(OBJ_STRING, old_ele);
+        argv[2]->no_free_val = 1;
+        feedAppendOnlyFile(server.pba.zremCommand, db_id, argv, 3);
+        decrRefCount(argv[0]);
+        decrRefCount(argv[2]);
+        argv[0] = createStringObject("ZADD", 4);
+        argv[2] = createStringObjectFromLongDouble(score, 0);
+        argv[3] = createObject(OBJ_STRING, new_ele);
+        argv[3]->no_free_val = 1;
+        feedAppendOnlyFile(server.pba.zaddCommand, db_id, argv, 4);
+        decrRefCount(argv[0]);
+        decrRefCount(argv[2]);
+        decrRefCount(argv[3]);
+    }
+}
+
+void defragHashPBA(int db_id, robj* key, sds field, sds old_val, sds new_val)
+{
+    serverAssert(is_nvm_addr(old_val) == is_nvm_addr(new_val));
+    if(IS_PBA() && is_nvm_addr(new_val))
+    {
+        robj* argv[4];
+        argv[0] = createStringObject("HSET", 4);
+        argv[1] = key;
+        argv[2] = createStringObject(field, sdslen(field));
+        argv[3] = createObject(OBJ_STRING, new_val);
+        argv[3]->no_free_val = 1;
+        feedAppendOnlyFile(server.pba.hsetCommand, db_id, argv, 4);
+        decrRefCount(argv[0]);
+        decrRefCount(argv[2]);
+        decrRefCount(argv[3]);
+    }
+}
+
+void defragListPBA(int db_id, robj* key, int index, sds old_ele, sds new_ele)
+{
+    serverAssert(is_nvm_addr(old_ele) == is_nvm_addr(new_ele));
+    if(IS_PBA() && is_nvm_addr(new_ele))
+    {
+        robj* argv[4];
+        argv[0] = createStringObject("LSET", 4);
+        argv[1] = key;
+        argv[2] = createStringObjectFromLongLong(index);
+        argv[3] = createObject(OBJ_STRING, new_ele);
+        argv[3]->no_free_val = 1;
+        feedAppendOnlyFile(server.pba.lsetCommand, db_id, argv, 4);
+        decrRefCount(argv[0]);
+        decrRefCount(argv[2]);
+        decrRefCount(argv[3]);
+    }
+}
+#endif
+
+#ifdef USE_NVM
+#ifdef SUPPORT_PBA
+int activeDefragZiplistZset(int db_id, robj* key, robj* o)
+#else
+int activeDefragZiplistZset(robj* o)
+#endif
+{
+    int defragged = 0;
+    unsigned char* new_zl = ziplistNew();
+    unsigned char* zl = o->ptr;
+    unsigned char* eptr = ziplistIndex(zl, ZIPLIST_HEAD);
+    unsigned char* sptr = ziplistNext(zl, eptr);
+    while(eptr)
+    {
+        double score = zzlGetScore(sptr);
+        unsigned char* str = NULL;
+        unsigned int len;
+        long long lval;
+        ziplistGet(eptr, &str, &len, &lval);
+        char buffer[128];
+        int buf_sz;
+        if(!str)
+        {
+            buf_sz = ll2string(buffer, sizeof(buffer), lval);
+            new_zl = ziplistPush(new_zl, (unsigned char*)buffer, buf_sz, ZIPLIST_TAIL);
+        }
+        else if(!is_nvm_addr(str))
+            new_zl = ziplistPush(new_zl, str, len, ZIPLIST_TAIL);
+        else
+        {
+            sds s = activeDefragSds((sds)str);
+            if(s)
+            {
+                serverAssert(is_nvm_addr(s));
+                defragged++;
+#ifdef SUPPORT_PBA
+                defragZsetPBA(db_id, key, (sds)str, s, score);
+#endif
+            }
+            else
+                s = (sds)str;
+            new_zl = ziplistPush(new_zl, (unsigned char*)s, len, ZIPLIST_TAIL);
+        }
+        buf_sz = d2string(buffer, sizeof(buffer), score);
+        new_zl = ziplistPush(new_zl, (unsigned char*)buffer, buf_sz, ZIPLIST_TAIL);
+        zzlNext(zl, &eptr, &sptr);
+    }
+    zfree(zl);
+    o->ptr = new_zl;
+    return defragged;
+}
+
+#ifdef SUPPORT_PBA
+int activeDefragZiplistHash(int db_id, robj* key, robj* o)
+#else
+int activeDefragZiplistHash(robj* o)
+#endif
+{
+    int defragged = 0;
+    unsigned char* new_zl = ziplistNew();
+    unsigned char* zl = o->ptr;
+    unsigned char* ptr = ziplistIndex(zl, ZIPLIST_HEAD);
+#ifdef SUPPORT_PBA
+    int is_value = 0;
+    unsigned char* field_str;
+    unsigned int field_len;
+    long long field_lval;
+#endif
+    while(ptr)
+    {
+        unsigned char* str = NULL;
+        unsigned int len;
+        long long lval;
+        ziplistGet(ptr, &str, &len, &lval);
+        if(!str)
+        {
+            char buffer[32];
+            int size = ll2string(buffer, sizeof(buffer), lval);
+            new_zl = ziplistPush(new_zl, (unsigned char*)buffer, size, ZIPLIST_TAIL);
+        }
+        else if(!is_nvm_addr(str))
+            new_zl = ziplistPush(new_zl, str, len, ZIPLIST_TAIL);
+        else
+        {
+            sds s = activeDefragSds((sds)str);
+            if(s)
+            {
+                serverAssert(is_nvm_addr(s));
+                defragged++;
+#ifdef SUPPORT_PBA
+                if(is_value)
+                {
+                    sds field = field_str ? sdsnewlen((char*)field_str, field_len) : sdsfromlonglong(field_lval);
+                    defragHashPBA(db_id, key, field, (sds)str, s);
+                    sdsfree(field);
+                }
+#endif
+            }
+            else
+                s = (sds)str;
+            new_zl = ziplistPush(new_zl, (unsigned char*)s, len, ZIPLIST_TAIL);
+        }
+#ifdef SUPPORT_PBA
+        if(!is_value)
+        {
+            field_str = str;
+            field_len = len;
+            field_lval = lval;
+        }
+        is_value = !is_value;
+#endif
+        ptr = ziplistNext(zl, ptr);
+    }
+    zfree(zl);
+    o->ptr = new_zl;
+    return defragged;
+}
+
+#ifdef SUPPORT_PBA
+int activeDefragQuicklistNode(int db_id, robj* key, quicklistNode* node, int* ele_index)
+#else
+int activeDefragQuicklistNode(quicklistNode* node)
+#endif
+{
+    if(node->encoding == QUICKLIST_NODE_ENCODING_LZF)
+    {
+#ifdef SUPPORT_PBA
+        (*ele_index) += node->count;
+#endif
+        return 0;
+    }
+    serverAssert(node->encoding == QUICKLIST_NODE_ENCODING_RAW);
+    int defragged = 0;
+    unsigned char* new_zl = ziplistNew();
+    unsigned char* zl = node->zl;
+    unsigned char* ptr = ziplistIndex(zl, ZIPLIST_HEAD);
+    while(ptr)
+    {
+        unsigned char* str = NULL;
+        unsigned int len;
+        long long lval;
+        ziplistGet(ptr, &str, &len, &lval);
+        if(!str)
+        {
+            char buffer[32];
+            int size = ll2string(buffer, sizeof(buffer), lval);
+            new_zl = ziplistPush(new_zl, (unsigned char*)buffer, size, ZIPLIST_TAIL);
+        }
+        else if(!is_nvm_addr(str))
+            new_zl = ziplistPush(new_zl, str, len, ZIPLIST_TAIL);
+        else if(IS_EMBED_IN_ZIPLIST(str, zl))
+        {
+            sds s = sdsnewlen(str, len);
+            new_zl = ziplistPush(new_zl, (unsigned char*)s, len, ZIPLIST_TAIL);
+            sdsfree(s);
+        }
+        else
+        {
+            sds s = activeDefragSds((sds)str);
+            if(s)
+            {
+                serverAssert(is_nvm_addr(s));
+                defragged++;
+#ifdef SUPPORT_PBA
+                defragListPBA(db_id, key, (*ele_index), (sds)str, s);
+#endif
+            }
+            else
+                s = (sds)str;
+            new_zl = ziplistPush(new_zl, (unsigned char*)s, len, ZIPLIST_TAIL);
+        }
+#ifdef SUPPORT_PBA
+        (*ele_index)++;
+#endif
+        ptr = ziplistNext(zl, ptr);
+    }
+    serverAssert(ziplistBlobLen(new_zl) == node->sz);
+    if(is_nvm_addr(zl))
+    {
+        unsigned char *new_zl_nvm = nvm_malloc(node->sz);
+        if(new_zl_nvm)
+        {
+            pmem_memcpy_persist(new_zl_nvm, new_zl, node->sz);
+            zfree(new_zl);
+            new_zl = new_zl_nvm;
+        }
+    }
+    zfree(node->zl);
+    node->zl = new_zl;
+    return defragged;
+}
+#endif
+
 /* for each key we scan in the main dict, this function will attempt to defrag
  * all the various pointers it has. Returns a stat of how many pointers were
  * moved. */
@@ -300,14 +646,44 @@ int defragKey(redisDb *db, dictEntry *de) {
         ob = newob;
     }
 
+#ifdef SUPPORT_PBA
+    robj* keyobj = NULL;
+    if(IS_PBA())
+        keyobj = createStringObject(de->key, sdslen(de->key));
+#endif
+
     if (ob->type == OBJ_STRING) {
         /* Already handled in activeDefragStringOb. */
+#ifdef SUPPORT_PBA
+        if(ob->encoding==OBJ_ENCODING_RAW) {
+            sds newsds = activeDefragSds((sds)ob->ptr);
+            if (newsds) {
+                defragStringPBA(db->id, keyobj, ob->ptr, newsds);
+                ob->ptr = newsds;
+                defragged++;
+            }
+        } else if (ob->encoding==OBJ_ENCODING_EMBSTR) {
+            /* The sds is embedded in the object allocation, calculate the
+             * offset and update the pointer in the new allocation. */
+            long ofs = (intptr_t)ob->ptr - (intptr_t)ob;
+            robj* ret;
+            if ((ret = activeDefragAlloc(ob))) {
+                ret->ptr = (void*)((intptr_t)ret + ofs);
+                defragged++;
+            }
+        } else if (ob->encoding!=OBJ_ENCODING_INT) {
+            serverPanic("Unknown string encoding");
+        }
+#endif
     } else if (ob->type == OBJ_LIST) {
         if (ob->encoding == OBJ_ENCODING_QUICKLIST) {
             quicklist *ql = ob->ptr, *newql;
             quicklistNode *node = ql->head, *newnode;
             if ((newql = activeDefragAlloc(ql)))
                 defragged++, ob->ptr = ql = newql;
+#ifdef SUPPORT_PBA
+            int ele_index = 0;
+#endif
             while (node) {
                 if ((newnode = activeDefragAlloc(node))) {
                     if (newnode->prev)
@@ -321,6 +697,13 @@ int defragKey(redisDb *db, dictEntry *de) {
                     node = newnode;
                     defragged++;
                 }
+#ifdef USE_NVM
+#ifdef SUPPORT_PBA
+                defragged += activeDefragQuicklistNode(db->id, keyobj, node, &ele_index);
+#else
+                defragged += activeDefragQuicklistNode(node);
+#endif
+#endif
                 if ((newzl = activeDefragAlloc(node->zl)))
                     defragged++, node->zl = newzl;
                 node = node->next;
@@ -338,7 +721,14 @@ int defragKey(redisDb *db, dictEntry *de) {
             while((de = dictNext(di)) != NULL) {
                 sds sdsele = dictGetKey(de);
                 if ((newsds = activeDefragSds(sdsele)))
+#ifdef SUPPORT_PBA
+                {
+                    defragSetPBA(db->id, keyobj, sdsele, newsds);
                     defragged++, de->key = newsds;
+                }
+#else
+                    defragged++, de->key = newsds;
+#endif
                 defragged += dictIterDefragEntry(di);
             }
             dictReleaseIterator(di);
@@ -353,6 +743,13 @@ int defragKey(redisDb *db, dictEntry *de) {
         }
     } else if (ob->type == OBJ_ZSET) {
         if (ob->encoding == OBJ_ENCODING_ZIPLIST) {
+#ifdef USE_NVM
+#ifdef SUPPORT_PBA
+            defragged += activeDefragZiplistZset(db->id, keyobj, ob);
+#else
+            defragged += activeDefragZiplistZset(ob);
+#endif
+#endif
             if ((newzl = activeDefragAlloc(ob->ptr)))
                 defragged++, ob->ptr = newzl;
         } else if (ob->encoding == OBJ_ENCODING_SKIPLIST) {
@@ -372,7 +769,14 @@ int defragKey(redisDb *db, dictEntry *de) {
                 double* newscore;
                 sds sdsele = dictGetKey(de);
                 if ((newsds = activeDefragSds(sdsele)))
+#ifdef SUPPORT_PBA
+                {
+                    defragZsetPBA(db->id, keyobj, sdsele, newsds, *(double*)dictGetVal(de));
                     defragged++, de->key = newsds;
+                }
+#else
+                    defragged++, de->key = newsds;
+#endif
                 newscore = zslDefrag(zs->zsl, *(double*)dictGetVal(de), sdsele, newsds);
                 if (newscore) {
                     dictSetVal(d, de, newscore);
@@ -387,6 +791,13 @@ int defragKey(redisDb *db, dictEntry *de) {
         }
     } else if (ob->type == OBJ_HASH) {
         if (ob->encoding == OBJ_ENCODING_ZIPLIST) {
+#ifdef USE_NVM
+#ifdef SUPPORT_PBA
+            defragged += activeDefragZiplistHash(db->id, keyobj, ob);
+#else
+            defragged += activeDefragZiplistHash(ob);
+#endif
+#endif
             if ((newzl = activeDefragAlloc(ob->ptr)))
                 defragged++, ob->ptr = newzl;
         } else if (ob->encoding == OBJ_ENCODING_HT) {
@@ -398,6 +809,14 @@ int defragKey(redisDb *db, dictEntry *de) {
                     defragged++, de->key = newsds;
                 sdsele = dictGetVal(de);
                 if ((newsds = activeDefragSds(sdsele)))
+#ifdef SUPPORT_PBA
+                {
+                    defragHashPBA(db->id, keyobj, dictGetKey(de), sdsele, newsds);
+                    defragged++, de->key = newsds;
+                }
+#else
+                    defragged++, de->key = newsds;
+#endif
                     defragged++, de->v.val = newsds;
                 defragged += dictIterDefragEntry(di);
             }
@@ -412,6 +831,12 @@ int defragKey(redisDb *db, dictEntry *de) {
     } else {
         serverPanic("Unknown object type");
     }
+
+#ifdef SUPPORT_PBA
+    if(IS_PBA())
+        decrRefCount(keyobj);
+#endif
+
     return defragged;
 }
 
@@ -469,6 +894,34 @@ float getAllocatorFragmentation(size_t *out_frag_bytes) {
     return frag_pct;
 }
 
+#ifdef USE_NVM
+float getNvmAllocatorFragmentation(size_t *out_frag_bytes) {
+    size_t epoch = 1, allocated = 0, resident = 0, active = 0, sz = sizeof(size_t);
+    /* Update the statistics cached by mallctl. */
+    jemk_mallctl("epoch", &epoch, &sz, &epoch, sz);
+    /* Unlike RSS, this does not include RSS from shared libraries and other non
+     * heap mappings. */
+    jemk_mallctl("stats.resident", &resident, &sz, NULL, 0);
+    /* Unlike resident, this doesn't not include the pages jemalloc reserves
+     * for re-use (purge will clean that). */
+    jemk_mallctl("stats.active", &active, &sz, NULL, 0);
+    /* Unlike zmalloc_used_memory, this matches the stats.resident by taking
+     * into account all allocations done by this process (not only zmalloc). */
+    jemk_mallctl("stats.allocated", &allocated, &sz, NULL, 0);
+    float frag_pct = ((float)active / allocated)*100 - 100;
+    size_t frag_bytes = active - allocated;
+    float rss_pct = ((float)resident / allocated)*100 - 100;
+    size_t rss_bytes = resident - allocated;
+    if(out_frag_bytes)
+        *out_frag_bytes = frag_bytes;
+    serverLog(LL_DEBUG,
+        "nvm allocated=%zu, active=%zu, resident=%zu, frag=%.0f%% (%.0f%% rss), frag_bytes=%zu (%zu%% rss)",
+        allocated, active, resident, frag_pct, rss_pct, frag_bytes, rss_bytes);
+    return frag_pct;
+}
+
+#endif
+
 #define INTERPOLATE(x, x1, x2, y1, y2) ( (y1) + ((x)-(x1)) * ((y2)-(y1)) / ((x2)-(x1)) )
 #define LIMIT(y, min, max) ((y)<(min)? min: ((y)>(max)? max: (y)))
 
@@ -491,11 +944,26 @@ void activeDefragCycle(void) {
      * or making it more aggressive. */
     run_with_period(1000) {
         size_t frag_bytes;
-        float frag_pct = getAllocatorFragmentation(&frag_bytes);
+        /* If we're not already running, and below the threshold, exit. */
+        float frag_pct = getAllocatorFragmentation(&frag_bytes);    
+
+#ifdef USE_NVM
+	size_t nvm_frag_bytes=0;
+	float nvm_frag_pct=0;
+        if(server.nvm_base) {
+	    nvm_frag_pct =getNvmAllocatorFragmentation(&nvm_frag_bytes);
+	}
+#endif
         /* If we're not already running, and below the threshold, exit. */
         if (!server.active_defrag_running) {
-            if(frag_pct < server.active_defrag_threshold_lower || frag_bytes < server.active_defrag_ignore_bytes)
-                return;
+#ifdef USE_NVM          
+            if(server.nvm_base &&(nvm_frag_pct < server.active_defrag_threshold_lower || nvm_frag_bytes < server.active_defrag_ignore_bytes)) {
+#endif
+                if(frag_pct < server.active_defrag_threshold_lower || frag_bytes < server.active_defrag_ignore_bytes)
+                    return;
+#ifdef USE_NVM            
+            }
+#endif
         }
 
         /* Calculate the adaptive aggressiveness of the defrag */
@@ -516,6 +984,9 @@ void activeDefragCycle(void) {
             serverLog(LL_VERBOSE,
                 "Starting active defrag, frag=%.0f%%, frag_bytes=%zu, cpu=%d%%",
                 frag_pct, frag_bytes, cpu_pct);
+#ifdef USE_NVM
+        serverLog(LL_VERBOSE,"nvm_frag=%.0f%%, nvm_frag_bytes=%zu", nvm_frag_pct, nvm_frag_bytes);
+#endif
         }
     }
     if (!server.active_defrag_running)
@@ -533,9 +1004,19 @@ void activeDefragCycle(void) {
                 long long now = ustime();
                 size_t frag_bytes;
                 float frag_pct = getAllocatorFragmentation(&frag_bytes);
+            
+#ifdef USE_NVM
+                size_t nvm_frag_bytes=0;
+                float nvm_frag_pct=0;
+                if(server.nvm_base)
+                    nvm_frag_pct=getNvmAllocatorFragmentation(&nvm_frag_bytes);
+#endif
                 serverLog(LL_VERBOSE,
                     "Active defrag done in %dms, reallocated=%d, frag=%.0f%%, frag_bytes=%zu",
                     (int)((now - start_scan)/1000), (int)(server.stat_active_defrag_hits - start_stat), frag_pct, frag_bytes);
+#ifdef USE_NVM
+                serverLog(LL_VERBOSE,"nvm_frag=%.0f%%, nvm_frag_bytes=%zu",nvm_frag_pct,nvm_frag_bytes);
+#endif
 
                 start_scan = now;
                 current_db = -1;

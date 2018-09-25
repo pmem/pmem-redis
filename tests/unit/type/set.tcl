@@ -1,13 +1,140 @@
 start_server {
     tags {"set"}
-    overrides {
+    overrides { 
         "set-max-intset-entries" 512
+        "nvm-maxcapacity" 10
+        "nvm-dir" "/mnt/pmem4/"
+        "nvm-threshold" 64
     }
 } {
     proc create_set {key entries} {
         r del $key
         foreach entry $entries { r sadd $key $entry }
     }
+
+    test {[NVM] bgsave NVM COW} {
+        waitForBgsave r
+        r flushdb
+        r save
+        r set x 10
+        r bgsave
+        waitForBgsave r
+        r debug reload
+        assert_equal 10 [r get x] 
+
+        for {set i 0} {$i < 100000} {incr i} {
+            set set_key nvm_set_$i
+            for {set j 0} {$j < 10} {incr j} {
+                r sadd $set_key a_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx_$j
+            }
+        }
+
+        set f [r info Memory]
+        regexp {used_nvm:(.*?)\r\n} $f - used_nvm
+        assert {$used_nvm>0}
+
+        r bgsave
+
+        for {set i 0} {$i < 10000} {incr i} {
+           set set_key nvm_set_$i          
+           r spop $set_key
+        }
+
+        for {set i 0} {$i < 20000} {incr i} {
+           r sadd nvm_set b_xxxxxxxxxxxxxxxxxxyyyyyyyyyyyyyyxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx_$i
+        }
+
+        set f2 [r info Memory]
+        regexp {used_nvm:(.*?)\r\n} $f2 - used_nvm
+        assert {$used_nvm>0}
+
+        waitForBgsave r
+        set x [r info persistence]
+        regexp {rdb_last_nvm_cow_size:(.*?)\r\n} $x - cowsize
+        assert {$cowsize>0}
+    }
+ 
+    test {[NVM] SADD overflows the maximum allowed string in hashtable less than 32 bits } {
+        r flushdb
+        for {set i 0} {$i < 10} {incr i} { r sadd nvm_ddrset [randstring 0 10 alpha] }
+        assert_encoding hashtable nvm_ddrset
+    }
+
+    test {[NVM] Is the data in NVM?} {
+        set i [r info Memory]
+        regexp {used_nvm:(.*?)\r\n} $i - used_nvm
+        assert {$used_nvm==0}
+    }
+
+
+    test {[NVM] SADD , SISMEMBER , SMEMBERS basics  larger than 64 bits} {
+        create_set nvmset {foo_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx}
+        assert_encoding hashtable nvmset
+        assert_equal 1 [r sadd nvmset bar_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]
+        assert_equal 0 [r sadd nvmset bar_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]
+        assert_equal 2 [r scard nvmset]
+        assert_equal 1 [r sismember nvmset foo_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]
+        assert_equal 1 [r sismember nvmset bar_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]
+        assert_equal 0 [r sismember nvmset bla_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]
+        assert_equal {bar_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx foo_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx} [lsort [r smembers nvmset]]
+    }
+    
+    test {[NVM] Is the data in NVM?} {
+        r sadd nvmset food_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+        set i [r info Memory]
+        regexp {used_nvm:(.*?)\r\n} $i - used_nvm
+        assert {$used_nvm>0}
+    }
+
+    test {[NVM] SADD - overflows the maximum allowed string in hashtable} {
+        r del nvmset
+        for {set i 0} {$i < 512} {incr i} { r sadd nvmset [randstring 0 1024 alpha] }
+        assert_encoding hashtable nvmset
+    }
+
+    test {[NVM] Is the data in NVM?} {
+        set i [r info Memory]
+        regexp {used_nvm:(.*?)\r\n} $i - used_nvm
+        assert {$used_nvm>0}
+    }
+
+    test {[NVM] SPOP - using string} {
+        r sadd nvm_set1 one_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+        r sadd nvm_set1 two_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+        r sadd nvm_set1 three_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+        assert_encoding hashtable nvm_set1
+        assert_equal 3 [r scard nvm_set1]
+        r spop nvm_set1 
+        assert_equal 2 [r scard nvm_set1]
+    }
+
+    test {[NVM] SDIFF - using string } {
+        r sadd nvm_diffset1 a_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+        r sadd nvm_diffset1 b_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+        r sadd nvm_diffset1 c_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+        r sadd nvm_diffset2 c_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+        r sadd nvm_diffset2 d_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+        r sadd nvm_diffset2 e_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+        r sdiff nvm_diffset1 nvm_diffset1
+    } {}
+
+
+    test {[NVM] SMOVE - using string} {
+        r sadd nvm_moveset1 one_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+        r sadd nvm_moveset1 two_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+        r sadd nvm_moveset2 three_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+        assert_equal 2 [r scard nvm_moveset1]
+        assert_equal 1 [r scard nvm_moveset2]
+
+        r smove nvm_moveset1 nvm_moveset2 two_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+        
+        assert_equal 1 [r scard nvm_moveset1]
+        assert_equal 2 [r scard nvm_moveset2]
+    }
+
+
 
     test {SADD, SCARD, SISMEMBER, SMEMBERS basics - regular set} {
         create_set myset {foo}

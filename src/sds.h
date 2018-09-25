@@ -1,5 +1,6 @@
 /* SDSLib 2.0 -- A C dynamic strings library
  *
+ * Copyright (c) 2018, Intel Corporation
  * Copyright (c) 2006-2015, Salvatore Sanfilippo <antirez at gmail dot com>
  * Copyright (c) 2015, Oran Agra
  * Copyright (c) 2015, Redis Labs, Inc
@@ -213,6 +214,15 @@ static inline void sdssetalloc(sds s, size_t newlen) {
             break;
     }
 }
+
+#ifdef USE_NVM
+size_t sdsheadersize(const sds s);
+sds sdsmvtonvm(const sds s);
+sds sdsmvtodram(const sds s);
+
+sds sdsnewlennvm(const void *init, size_t initlen);
+sds sdsdupnvm(const sds s);
+#endif
 
 sds sdsnewlen(const void *init, size_t initlen);
 sds sdsnew(const char *init);

@@ -32,6 +32,11 @@
 #include "slowlog.h"
 #include "bio.h"
 #include "latency.h"
+#ifdef USE_NVM
+#include "nvm.h"
+#include "libpmem.h"
+#endif
+
 #include "atomicvar.h"
 
 #include <time.h>
@@ -152,6 +157,9 @@ struct redisCommand redisCommandTable[] = {
     {"linsert",linsertCommand,5,"wm",0,NULL,1,1,1,0,0},
     {"rpop",rpopCommand,2,"wF",0,NULL,1,1,1,0,0},
     {"lpop",lpopCommand,2,"wF",0,NULL,1,1,1,0,0},
+#ifdef SUPPORT_PBA
+    {"ldel",ldelCommand,3,"w",0,NULL,1,1,1,0,0},
+#endif
     {"brpop",brpopCommand,-3,"ws",0,NULL,1,-2,1,0,0},
     {"brpoplpush",brpoplpushCommand,4,"wms",0,NULL,1,2,1,0,0},
     {"blpop",blpopCommand,-3,"ws",0,NULL,1,-2,1,0,0},
@@ -1168,6 +1176,25 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
             server.rdb_bgsave_scheduled = 0;
     }
 
+#ifdef SUPPORT_PBA
+    long long free_mstime = server.mstime - FREE_LIST_DELAY_MS;
+    while(server.pba.free_head)
+    {
+        struct free_list* node = server.pba.free_head;
+        if(node->mstime > free_mstime)
+            break;
+        server.pba.free_head = node->next;
+        if(!server.pba.free_head)
+        {
+            serverAssert(node == server.pba.free_tail);
+            server.pba.free_tail = 0;
+        }
+        serverAssert(is_nvm_addr(node->ptr));
+        nvm_free(node->ptr);
+        zfree(node);
+    }
+#endif
+
     server.cronloops++;
     return 1000/server.hz;
 }
@@ -1518,6 +1545,28 @@ void initServerConfig(void) {
     server.assert_line = 0;
     server.bug_report_start = 0;
     server.watchdog_period = 0;
+
+#ifdef SUPPORT_PBA
+    server.pba.enable = 0;
+    server.pba.loading = 0;
+    server.pba.setCommand = lookupCommandByCString("SET");
+    server.pba.saddCommand = lookupCommandByCString("SADD");
+    server.pba.hsetCommand = lookupCommandByCString("HSET");
+    server.pba.lsetCommand = lookupCommandByCString("LSET");
+    server.pba.ldelCommand = lookupCommandByCString("LDEL");
+    server.pba.zaddCommand = lookupCommandByCString("ZADD");
+    server.pba.zremCommand = lookupCommandByCString("ZREM");
+    server.pba.arg = 0;
+    server.pba.free_head = 0;
+    server.pba.free_tail = 0;
+    server.pba.jemallocat = 0;
+    server.pba.move_list = 0;
+    server.pba.defrag_debug = 0;
+#endif
+
+#ifdef USE_AOFGUARD
+    server.aofguard.enable = 0;
+#endif
 }
 
 extern char **environ;
@@ -1782,6 +1831,51 @@ void resetServerStats(void) {
     server.aof_delayed_fsync = 0;
 }
 
+#ifdef USE_NVM
+void allocateNVMSpace(void) {
+    char filename[128];
+    if(server.nvm_size==0) return;
+
+    size_t size_in_GB = (server.nvm_size >> 30);
+    snprintf(filename, sizeof(filename) - 1, "redis-port-%d-%ldGB-AEP", server.port, size_in_GB);
+    filename[127] = '\0';
+
+    if (memkind_create_pmem(server.nvm_dir, filename, server.nvm_size, &(server.pmem_kind))) {
+        fprintf(stderr, "memkind_create_pmem failed");
+        exit(1);
+    }
+    server.nvm_base = memkind_base_addr(server.pmem_kind);
+    zmalloc_get_nvm_config(server.sdsmv_threshold,server.pmem_kind); 
+}
+#endif
+
+#ifdef AEP_COW
+/*if the addr is in forked address, then keep the old address*/
+void * redisduplicatenvmaddr(void *addr) {
+    void * nvm_addr=addr;
+    size_t size;
+    if(server.rdb_child_pid != -1 && 
+    is_nvm_addr(addr) && !cow_isnvmaddrindict(server.forked_dict,addr)) {
+        void * dupaddr=NULL;    
+        size= jemk_malloc_usable_size(addr);
+        dupaddr = nvm_malloc(size);
+        if(!dupaddr) {
+            dupaddr=zmalloc(size);  
+            memcpy(dupaddr,addr, size);
+            server.cow_mem_size +=size;
+        }else {
+            pmem_memcpy_persist(dupaddr, addr, size);
+            cow_addaddressindict(server.forked_dict, dupaddr);
+            server.cow_nvm_size +=size;
+        }
+        assert(dupaddr != NULL);
+        cow_addaddressindict(server.cow_dict,addr);
+        nvm_addr=dupaddr;
+    }
+    return nvm_addr;
+}
+#endif
+
 void initServer(void) {
     int j;
 
@@ -1849,10 +1943,16 @@ void initServer(void) {
         server.db[j].expires = dictCreate(&keyptrDictType,NULL);
         server.db[j].blocking_keys = dictCreate(&keylistDictType,NULL);
         server.db[j].ready_keys = dictCreate(&objectKeyPointerValueDictType,NULL);
-        server.db[j].watched_keys = dictCreate(&keylistDictType,NULL);
+        server.db[j].watched_keys = dictCreate(&keylistDictType,NULL);        
         server.db[j].id = j;
         server.db[j].avg_ttl = 0;
     }
+
+#ifdef AEP_COW
+    server.forked_dict = cow_createforknvmdict();
+    server.cow_dict = cow_createcownvmdict();
+#endif
+
     evictionPoolAlloc(); /* Initialize the LRU keys pool. */
     server.pubsub_channels = dictCreate(&keylistDictType,NULL);
     server.pubsub_patterns = listCreate();
@@ -1926,6 +2026,18 @@ void initServer(void) {
                 strerror(errno));
             exit(1);
         }
+#ifdef USE_AOFGUARD
+        if(server.aofguard.enable)
+        {
+            server.aofguard.aofguard = zmalloc(sizeof(struct aofguard));
+            if(!aofguard_init(server.aofguard.aofguard, server.aof_fd, server.aofguard.nvm_dir_fd,
+                server.aofguard.nvm_file_name, AOFGUARD_NVM_SIZE, 0))
+            {
+                serverLog(LL_WARNING, "aofguard_init() for '%s/%s' failed!", server.nvm_dir, server.aofguard.nvm_file_name);
+                exit(1);
+            }
+        }
+#endif
     }
 
     /* 32 bit instances are limited to 4GB of address space, so if there is
@@ -1945,6 +2057,9 @@ void initServer(void) {
     latencyMonitorInit();
     bioInit();
     server.initial_memory_usage = zmalloc_used_memory();
+#ifdef USE_NVM
+    allocateNVMSpace();
+#endif
 }
 
 /* Populates the Redis Command Table starting from the hard coded list
@@ -2481,6 +2596,9 @@ int processCommand(client *c) {
         if (listLength(server.ready_keys))
             handleClientsBlockedOnLists();
     }
+#ifdef SUPPORT_PBA
+    server.pba.arg = 0;
+#endif
     return C_OK;
 }
 
@@ -2896,6 +3014,18 @@ sds genRedisInfoString(char *section) {
         char used_memory_lua_hmem[64];
         char used_memory_rss_hmem[64];
         char maxmemory_hmem[64];
+
+#ifdef USE_NVM
+        char nvm_used_hmem[64];
+        char nvm_rss_hmem[64];
+        char peak_nvm_hmem[64];
+        char nvm_size_hmem[64];
+        size_t nvm_used = nvm_get_used();
+        size_t nvm_alloc_count = nvm_get_alloc_count();
+        size_t nvm_rss = nvm_get_rss();
+        float nvm_fragmentation = (float)nvm_rss/nvm_used;
+#endif
+
         size_t zmalloc_used = zmalloc_used_memory();
         size_t total_system_mem = server.system_memory_size;
         const char *evict_policy = evictPolicyToString();
@@ -2909,6 +3039,18 @@ sds genRedisInfoString(char *section) {
         if (zmalloc_used > server.stat_peak_memory)
             server.stat_peak_memory = zmalloc_used;
 
+#ifdef USE_NVM
+        if (nvm_used > server.stat_peak_nvm)
+            server.stat_peak_nvm = nvm_used;
+
+        bytesToHuman(nvm_used_hmem, nvm_used);
+        bytesToHuman(nvm_rss_hmem, nvm_rss);
+        bytesToHuman(peak_nvm_hmem, server.stat_peak_nvm);
+        bytesToHuman(nvm_size_hmem, server.nvm_size);
+
+
+#endif
+
         bytesToHuman(hmem,zmalloc_used);
         bytesToHuman(peak_hmem,server.stat_peak_memory);
         bytesToHuman(total_system_hmem,total_system_mem);
@@ -2919,6 +3061,18 @@ sds genRedisInfoString(char *section) {
         if (sections++) info = sdscat(info,"\r\n");
         info = sdscatprintf(info,
             "# Memory\r\n"
+#ifdef USE_NVM
+            "used_nvm:%zu\r\n"
+            "used_nvm_human:%s\r\n"
+            "allocated_nvm_count: %zu\r\n"
+            "used_nvm_rss:%zu\r\n"
+            "used_nvm_rss_human:%s\r\n"
+            "used_nvm_peak:%zu\r\n"
+            "used_nvm_peak_human:%s\r\n"
+            "max_nvm_capacity:%zu\r\n"
+            "max_nvm_capacity_human:%s\r\n"
+            "nvm_fragmentation_ratio:%.2f\r\n"
+#endif
             "used_memory:%zu\r\n"
             "used_memory_human:%s\r\n"
             "used_memory_rss:%zu\r\n"
@@ -2941,6 +3095,18 @@ sds genRedisInfoString(char *section) {
             "mem_allocator:%s\r\n"
             "active_defrag_running:%d\r\n"
             "lazyfree_pending_objects:%zu\r\n",
+#ifdef USE_NVM
+            nvm_used,
+            nvm_used_hmem,
+            nvm_alloc_count,
+            nvm_rss,
+            nvm_rss_hmem,
+            server.stat_peak_nvm,
+            peak_nvm_hmem,
+            server.nvm_size,
+            nvm_size_hmem,
+            nvm_fragmentation,
+#endif
             zmalloc_used,
             hmem,
             server.resident_set_size,
@@ -2980,7 +3146,10 @@ sds genRedisInfoString(char *section) {
             "rdb_last_bgsave_time_sec:%jd\r\n"
             "rdb_current_bgsave_time_sec:%jd\r\n"
             "rdb_last_cow_size:%zu\r\n"
-            "aof_enabled:%d\r\n"
+#ifdef AEP_COW            
+	    "rdb_last_nvm_cow_size:%zu\r\n"
+#endif            
+	    "aof_enabled:%d\r\n"
             "aof_rewrite_in_progress:%d\r\n"
             "aof_rewrite_scheduled:%d\r\n"
             "aof_last_rewrite_time_sec:%jd\r\n"
@@ -2997,7 +3166,10 @@ sds genRedisInfoString(char *section) {
             (intmax_t)((server.rdb_child_pid == -1) ?
                 -1 : time(NULL)-server.rdb_save_time_start),
             server.stat_rdb_cow_bytes,
-            server.aof_state != AOF_OFF,
+#ifdef AEP_COW      
+      	    server.last_nvm_cow_size,
+#endif            
+	    server.aof_state != AOF_OFF,
             server.aof_child_pid != -1,
             server.aof_rewrite_scheduled,
             (intmax_t)server.aof_rewrite_time_last,
@@ -3687,6 +3859,10 @@ int main(int argc, char **argv) {
 #endif
     setlocale(LC_COLLATE,"");
     zmalloc_set_oom_handler(redisOutOfMemoryHandler);
+#ifdef USE_NVM
+    zmalloc_init_nvm(is_nvm_addr, nvm_usable_size, nvm_malloc,
+                     nvm_free, nvm_get_used);
+#endif
     srand(time(NULL)^getpid());
     gettimeofday(&tv,NULL);
     char hashseed[16];
@@ -3846,4 +4022,24 @@ int main(int argc, char **argv) {
     return 0;
 }
 
+#ifdef SUPPORT_PBA
+void setArgPBA(sds s)
+{
+    if(!IS_PBA())
+        return;
+    if(server.pba.arg && is_nvm_addr(s))
+    {
+        if(server.pba.arg->encoding == OBJ_ENCODING_RAW)
+        {
+            if(!server.pba.arg->no_free_val)
+                sdsfree(server.pba.arg->ptr);
+        }
+        else
+            serverAssert(server.pba.arg->encoding == OBJ_ENCODING_EMBSTR);
+        server.pba.arg->encoding = OBJ_ENCODING_RAW;
+        server.pba.arg->ptr = s;
+        server.pba.arg->no_free_val = 1;
+    }
+}
+#endif
 /* The End */

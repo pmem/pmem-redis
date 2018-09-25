@@ -63,6 +63,9 @@ static struct config {
     int datasize;
     int randomkeys;
     int randomkeys_keyspacelen;
+    int randomfields;
+    int randomfields_fieldspacelen;
+    int randomscore_spacelen;
     int keepalive;
     int pipeline;
     int showerrors;
@@ -163,6 +166,34 @@ static void randomizeClientKey(client c) {
         size_t j;
 
         for (j = 0; j < 12; j++) {
+            *p = '0'+r%10;
+            r/=10;
+            p--;
+        }
+    }
+}
+
+static void randomizeClientField(client c) {
+    char *p = c->obuf;
+    if ((p = strstr(p,"field:")) != NULL) {
+        p = p+6+13;
+        size_t r = random() % config.randomfields_fieldspacelen;
+        size_t j;
+        for (j = 0; j < 14; j++) {
+            *p = '0'+r%10;
+            r/=10;
+            p--;
+        }
+    }
+}
+
+static void randomizeClientScore(client c) {
+    char *p = c->obuf;
+    if ((p = strstr(p,"__rand_score__")) != NULL) {
+        p = p+13;
+        size_t r = random() % config.randomscore_spacelen;
+        size_t j;
+        for (j = 0; j < 14; j++) {
             *p = '0'+r%10;
             r/=10;
             p--;
@@ -271,6 +302,8 @@ static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
 
         /* Really initialize: randomize keys and set start time. */
         if (config.randomkeys) randomizeClientKey(c);
+        if (config.randomfields) randomizeClientField(c);
+        if (config.randomscore_spacelen) randomizeClientScore(c);
         c->start = ustime();
         c->latency = -1;
     }
@@ -444,10 +477,10 @@ static void showLatencyReport(void) {
 
         qsort(config.latency,config.requests,sizeof(long long),compareLatency);
         for (i = 0; i < config.requests; i++) {
-            if (config.latency[i]/1000 != curlat || i == (config.requests-1)) {
-                curlat = config.latency[i]/1000;
+            if (config.latency[i]/10 != curlat || i == (config.requests-1)) {
+                curlat = config.latency[i]/10;
                 perc = ((float)(i+1)*100)/config.requests;
-                printf("%.2f%% <= %d milliseconds\n", perc, curlat);
+                printf("%.2f%% <= %d (10us)\n", perc, curlat);
             }
         }
         printf("%.2f requests per second\n\n", reqpersec);
@@ -521,6 +554,12 @@ int parseOptions(int argc, const char **argv) {
             config.randomkeys_keyspacelen = atoi(argv[++i]);
             if (config.randomkeys_keyspacelen < 0)
                 config.randomkeys_keyspacelen = 0;
+        } else if (!strcmp(argv[i],"-f")) {
+            if (lastarg) goto invalid;
+            config.randomfields = 1;
+            config.randomfields_fieldspacelen = atoi(argv[++i]);
+            if (config.randomfields_fieldspacelen < 0)
+                config.randomfields_fieldspacelen = 0;
         } else if (!strcmp(argv[i],"-q")) {
             config.quiet = 1;
         } else if (!strcmp(argv[i],"--csv")) {
@@ -581,6 +620,7 @@ usage:
 "  from 0 to keyspacelen-1. The substitution changes every time a command\n"
 "  is executed. Default tests use this to hit random keys in the\n"
 "  specified range.\n"
+" -f <fieldspacelen> Use random field value for SADD/HSET\n"
 " -P <numreq>        Pipeline <numreq> requests. Default 1 (no pipeline).\n"
 " -e                 If server replies with errors, show them on stdout.\n"
 "                    (no more than 1 error per second is displayed)\n"
@@ -721,6 +761,17 @@ int main(int argc, const char **argv) {
         memset(data,'x',config.datasize);
         data[config.datasize] = '\0';
 
+        if (test_is_selected("sadd") || test_is_selected("lpush") ||
+            test_is_selected("rpush") || test_is_selected("zadd") ||
+            test_is_selected("zrem")) {
+            int min_size = strlen("field:__rand_field__");
+            if (config.datasize - min_size < 0) {
+                printf("Minimum datasize should be %d\n", min_size);
+                break;
+            }
+            data[config.datasize - min_size] = '\0';
+        }
+
         if (test_is_selected("ping_inline") || test_is_selected("ping"))
             benchmark("PING_INLINE","PING\r\n",6);
 
@@ -733,6 +784,13 @@ int main(int argc, const char **argv) {
         if (test_is_selected("set")) {
             len = redisFormatCommand(&cmd,"SET key:__rand_int__ %s",data);
             benchmark("SET",cmd,len);
+            free(cmd);
+        }
+
+        if(test_is_selected("set_bigkey"))
+        {
+            len = redisFormatCommand(&cmd, "SET key:__rand_int__%s xxxx", data);
+            benchmark("SET", cmd, len);
             free(cmd);
         }
 
@@ -749,45 +807,68 @@ int main(int argc, const char **argv) {
         }
 
         if (test_is_selected("lpush")) {
-            len = redisFormatCommand(&cmd,"LPUSH mylist %s",data);
+            len = redisFormatCommand(&cmd,"LPUSH mylist:__rand_int__ %sfield:__rand_field__",data);
             benchmark("LPUSH",cmd,len);
             free(cmd);
         }
 
         if (test_is_selected("rpush")) {
-            len = redisFormatCommand(&cmd,"RPUSH mylist %s",data);
+            len = redisFormatCommand(&cmd,"RPUSH mylist:__rand_int__ %sfield:__rand_field__",data);
             benchmark("RPUSH",cmd,len);
             free(cmd);
         }
 
         if (test_is_selected("lpop")) {
-            len = redisFormatCommand(&cmd,"LPOP mylist");
+            len = redisFormatCommand(&cmd,"LPOP mylist:__rand_int__");
             benchmark("LPOP",cmd,len);
             free(cmd);
         }
 
         if (test_is_selected("rpop")) {
-            len = redisFormatCommand(&cmd,"RPOP mylist");
+            len = redisFormatCommand(&cmd,"RPOP mylist:__rand_int__");
             benchmark("RPOP",cmd,len);
             free(cmd);
         }
 
         if (test_is_selected("sadd")) {
             len = redisFormatCommand(&cmd,
-                "SADD myset element:__rand_int__");
+                "SADD myset:__rand_int__ %sfield:__rand_field__",data);
             benchmark("SADD",cmd,len);
+            free(cmd);
+        }
+
+        if (test_is_selected("zadd")) {
+            config.randomscore_spacelen = config.randomfields_fieldspacelen;
+            len = redisFormatCommand(&cmd,
+                "ZADD zset:__rand_int__ __rand_score__ %sfield:__rand_field__",data);
+            benchmark("ZADD",cmd,len);
+            free(cmd);
+            config.randomscore_spacelen = 0;
+        }
+
+        if (test_is_selected("zrem")) {
+            len = redisFormatCommand(&cmd,
+                "ZREM zset:__rand_int__ %sfield:__rand_field__",data);
+            benchmark("ZREM",cmd,len);
             free(cmd);
         }
 
         if (test_is_selected("hset")) {
             len = redisFormatCommand(&cmd,
-                "HSET myset:__rand_int__ element:__rand_int__ %s",data);
+                "HSET myhash:__rand_int__ field:__rand_field__ %s",data);
             benchmark("HSET",cmd,len);
             free(cmd);
         }
 
+        if (test_is_selected("hdel")) {
+            len = redisFormatCommand(&cmd,
+                "HDEL myhash:__rand_int__ field:__rand_field__");
+            benchmark("HDEL",cmd,len);
+            free(cmd);
+        }
+
         if (test_is_selected("spop")) {
-            len = redisFormatCommand(&cmd,"SPOP myset");
+            len = redisFormatCommand(&cmd,"SPOP myset:__rand_int__");
             benchmark("SPOP",cmd,len);
             free(cmd);
         }

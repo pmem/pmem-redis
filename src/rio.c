@@ -15,6 +15,7 @@
  *
  * ----------------------------------------------------------------------------
  *
+ * Copyright (c) 2018, Intel Corporation
  * Copyright (c) 2009-2012, Pieter Noordhuis <pcnoordhuis at gmail dot com>
  * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
  * All rights reserved.
@@ -55,6 +56,9 @@
 #include "config.h"
 #include "server.h"
 
+#ifdef SUPPORT_PBA
+#include "nvm.h"
+#endif
 /* ------------------------- Buffer I/O implementation ----------------------- */
 
 /* Returns 1 or 0 for success/failure. */
@@ -331,6 +335,43 @@ size_t rioWriteBulkString(rio *r, const char *buf, size_t len) {
     if (rioWrite(r,"\r\n",2) == 0) return 0;
     return nwritten+len+2;
 }
+
+#ifdef SUPPORT_PBA
+size_t rioWriteBulkStringPBA(rio *r, const char *buf, size_t len)
+{
+    size_t nwritten;
+    if(server.pba.enable)
+    {
+        if(is_nvm_addr(buf))
+        {
+            size_t offset = buf - (char*)server.nvm_base;
+            char offset_buf[32];
+            offset_buf[0] = '@';
+            sprintf(offset_buf + 1, "%lx", offset);
+            size_t offset_buf_len = strlen(offset_buf);
+            if((nwritten = rioWriteBulkCount(r, '$', offset_buf_len)) == 0 ||
+                rioWrite(r, offset_buf, offset_buf_len) == 0 ||
+                rioWrite(r, "\r\n", 2) == 0)
+                return 0;
+            return nwritten + offset_buf_len + 2;
+        }
+        else if(len && (buf[0] == '@' || buf[0] == '#'))
+        {
+            char prefix = '#';
+            if((nwritten = rioWriteBulkCount(r, '$', 1 + len)) == 0 ||
+                rioWrite(r, &prefix, 1) == 0 ||
+                rioWrite(r, buf, len) == 0 ||
+                rioWrite(r, "\r\n", 2) == 0)
+                return 0;
+            return nwritten + len + 3;
+        }
+    }
+    if ((nwritten = rioWriteBulkCount(r,'$',len)) == 0) return 0;
+    if (len > 0 && rioWrite(r,buf,len) == 0) return 0;
+    if (rioWrite(r,"\r\n",2) == 0) return 0;
+    return nwritten+len+2;
+}
+#endif
 
 /* Write a long long value in format: "$<count>\r\n<payload>\r\n". */
 size_t rioWriteBulkLongLong(rio *r, long long l) {

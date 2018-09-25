@@ -150,6 +150,7 @@
  *
  * ----------------------------------------------------------------------------
  *
+ * Copyright (c) 2018, Intel Corporation
  * Copyright (c) 2009-2012, Pieter Noordhuis <pcnoordhuis at gmail dot com>
  * Copyright (c) 2009-2017, Salvatore Sanfilippo <antirez at gmail dot com>
  * All rights reserved.
@@ -189,6 +190,9 @@
 #include "ziplist.h"
 #include "endianconv.h"
 #include "redisassert.h"
+#ifdef USE_NVM
+#include "nvm.h"
+#endif
 
 #define ZIP_END 255         /* Special "end of ziplist" entry. */
 #define ZIP_BIG_PREVLEN 254 /* Max number of bytes of the previous entry, for
@@ -204,6 +208,11 @@
 #define ZIP_STR_06B (0 << 6)
 #define ZIP_STR_14B (1 << 6)
 #define ZIP_STR_32B (2 << 6)
+
+#ifdef USE_NVM
+#define ZIP_NVM_PTR 0xc1
+#endif
+
 #define ZIP_INT_16B (0xc0 | 0<<4)
 #define ZIP_INT_32B (0xc0 | 1<<4)
 #define ZIP_INT_64B (0xc0 | 2<<4)
@@ -352,7 +361,16 @@ unsigned int zipStoreEntryEncoding(unsigned char *p, unsigned char encoding, uns
             buf[3] = (rawlen >> 8) & 0xff;
             buf[4] = rawlen & 0xff;
         }
-    } else {
+    }
+#ifdef USE_NVM
+    else if(encoding == ZIP_NVM_PTR)
+    {
+        if(!p)
+            return len;
+        buf[0] = ZIP_NVM_PTR;
+    }
+#endif
+    else {
         /* Implies integer encoding, so length is always 1. */
         if (!p) return len;
         buf[0] = encoding;
@@ -368,6 +386,36 @@ unsigned int zipStoreEntryEncoding(unsigned char *p, unsigned char encoding, uns
  * The 'encoding' variable will hold the entry encoding, the 'lensize'
  * variable will hold the number of bytes required to encode the entry
  * length, and the 'len' variable will hold the entry length. */
+#ifdef USE_NVM
+#define ZIP_DECODE_LENGTH(ptr, encoding, lensize, len) do {                    \
+    ZIP_ENTRY_ENCODING((ptr), (encoding));                                     \
+    if ((encoding) < ZIP_STR_MASK) {                                           \
+        if ((encoding) == ZIP_STR_06B) {                                       \
+            (lensize) = 1;                                                     \
+            (len) = (ptr)[0] & 0x3f;                                           \
+        } else if ((encoding) == ZIP_STR_14B) {                                \
+            (lensize) = 2;                                                     \
+            (len) = (((ptr)[0] & 0x3f) << 8) | (ptr)[1];                       \
+        } else if ((encoding) == ZIP_STR_32B) {                                \
+            (lensize) = 5;                                                     \
+            (len) = ((ptr)[1] << 24) |                                         \
+                    ((ptr)[2] << 16) |                                         \
+                    ((ptr)[3] <<  8) |                                         \
+                    ((ptr)[4]);                                                \
+        } else {                                                               \
+            panic("Invalid string encoding 0x%02X", (encoding));               \
+        }                                                                      \
+    } else if((encoding) == ZIP_NVM_PTR) {                                     \
+        (lensize) = 1;                                                         \
+        (len) = sizeof(void*);                                                 \
+    } else {                                                                   \
+        (lensize) = 1;                                                         \
+        (len) = zipIntSize(encoding);                                          \
+    }                                                                          \
+} while(0);
+
+#else
+
 #define ZIP_DECODE_LENGTH(ptr, encoding, lensize, len) do {                    \
     ZIP_ENTRY_ENCODING((ptr), (encoding));                                     \
     if ((encoding) < ZIP_STR_MASK) {                                           \
@@ -391,6 +439,7 @@ unsigned int zipStoreEntryEncoding(unsigned char *p, unsigned char encoding, uns
         (len) = zipIntSize(encoding);                                          \
     }                                                                          \
 } while(0);
+#endif
 
 /* Encode the length of the previous entry and write it to "p". This only
  * uses the larger encoding (required in __ziplistCascadeUpdate). */
@@ -585,6 +634,46 @@ unsigned char *ziplistNew(void) {
     return zl;
 }
 
+#ifdef USE_NVM
+/* update item at "p". */
+unsigned char* ziplistNVMEntryDecode(unsigned char* zl)
+{
+    if(!zl)
+        return zl;
+    unsigned char* new_zl = ziplistNew();
+    unsigned char* fptr = ziplistIndex(zl, ZIPLIST_HEAD);
+    while(fptr)
+    {
+        unsigned char* vstr = NULL;
+        unsigned int vlen = UINT_MAX;
+        long long vll = LLONG_MAX;
+        ziplistGet(fptr, &vstr, &vlen, &vll);
+        if(vstr)
+        {
+            if(is_nvm_addr(vstr))
+            {
+                void* ptr = zmalloc(vlen);
+                memcpy(ptr, vstr, vlen);
+                new_zl = ziplistPush(new_zl, ptr, vlen, ZIPLIST_TAIL);
+                zfree(ptr);
+            }
+            else
+                new_zl = ziplistPush(new_zl, vstr, vlen, ZIPLIST_TAIL);
+        }
+        else
+        {
+            char buffer[32];
+            int len = ll2string(buffer, 32, vll);
+            new_zl = ziplistPush(new_zl, (unsigned char*)buffer, len, ZIPLIST_TAIL);
+        }
+        fptr = ziplistNext(zl, fptr);
+    }
+    return new_zl;
+}
+
+#endif
+
+
 /* Resize the ziplist. */
 unsigned char *ziplistResize(unsigned char *zl, unsigned int len) {
     zl = zrealloc(zl,len);
@@ -675,7 +764,12 @@ unsigned char *__ziplistCascadeUpdate(unsigned char *zl, unsigned char *p) {
 }
 
 /* Delete "num" entries, starting at "p". Returns pointer to the ziplist. */
-unsigned char *__ziplistDelete(unsigned char *zl, unsigned char *p, unsigned int num) {
+#ifdef USE_NVM
+unsigned char *__ziplistDelete(unsigned char *zl, unsigned char *p, unsigned int num, int free_nvm_ptr)
+#else
+unsigned char *__ziplistDelete(unsigned char *zl, unsigned char *p, unsigned int num)
+#endif
+{
     unsigned int i, totlen, deleted = 0;
     size_t offset;
     int nextdiff = 0;
@@ -683,6 +777,18 @@ unsigned char *__ziplistDelete(unsigned char *zl, unsigned char *p, unsigned int
 
     zipEntry(p, &first);
     for (i = 0; p[0] != ZIP_END && i < num; i++) {
+#ifdef USE_NVM
+        if(free_nvm_ptr)
+        {
+            zlentry entry;
+            zipEntry(p, &entry);
+            if(entry.encoding == ZIP_NVM_PTR) {
+                assert(entry.len == sizeof(sds*));
+                sds s = *((sds*)(p+entry.headersize));
+                sdsfree(s);
+            }
+        }
+#endif
         p += zipRawEntryLength(p);
         deleted++;
     }
@@ -765,7 +871,14 @@ unsigned char *__ziplistInsert(unsigned char *zl, unsigned char *p, unsigned cha
     if (zipTryEncoding(s,slen,&value,&encoding)) {
         /* 'encoding' is set to the appropriate integer encoding */
         reqlen = zipIntSize(encoding);
-    } else {
+    }
+#ifdef USE_NVM
+    else if(is_nvm_addr(s)) {
+        encoding = ZIP_NVM_PTR;
+        reqlen = sizeof(void*);
+    }
+#endif
+    else {
         /* 'encoding' is untouched, however zipStoreEntryEncoding will use the
          * string length to figure out how to encode it. */
         reqlen = slen;
@@ -831,7 +944,13 @@ unsigned char *__ziplistInsert(unsigned char *zl, unsigned char *p, unsigned cha
     p += zipStoreEntryEncoding(p,encoding,slen);
     if (ZIP_IS_STR(encoding)) {
         memcpy(p,s,slen);
-    } else {
+    }
+#ifdef USE_NVM
+    else if(encoding == ZIP_NVM_PTR) {
+        (*((void**)p)) = s;
+    }
+#endif
+    else {
         zipSaveInteger(p,value,encoding);
     }
     ZIPLIST_INCR_LENGTH(zl,1);
@@ -1042,7 +1161,19 @@ unsigned int ziplistGet(unsigned char *p, unsigned char **sstr, unsigned int *sl
             *slen = entry.len;
             *sstr = p+entry.headersize;
         }
-    } else {
+    }
+#ifdef USE_NVM
+    else if(entry.encoding == ZIP_NVM_PTR) {
+        assert(entry.len = sizeof(void*));
+        sds s = (*((void**)(p + entry.headersize)));
+        if(sstr)
+        {
+            (*slen) = sdslen(s);
+            (*sstr) = (unsigned char*)s;
+        }
+    }
+#endif
+    else {
         if (sval) {
             *sval = zipLoadInteger(p+entry.headersize,entry.encoding);
         }
@@ -1060,8 +1191,11 @@ unsigned char *ziplistInsert(unsigned char *zl, unsigned char *p, unsigned char 
  * ziplist, while deleting entries. */
 unsigned char *ziplistDelete(unsigned char *zl, unsigned char **p) {
     size_t offset = *p-zl;
+#ifdef USE_NVM
+    zl = __ziplistDelete(zl,*p,1, 1);
+#else
     zl = __ziplistDelete(zl,*p,1);
-
+#endif
     /* Store pointer to current element in p, because ziplistDelete will
      * do a realloc which might result in a different "zl"-pointer.
      * When the delete direction is back to front, we might delete the last
@@ -1073,8 +1207,19 @@ unsigned char *ziplistDelete(unsigned char *zl, unsigned char **p) {
 /* Delete a range of entries from the ziplist. */
 unsigned char *ziplistDeleteRange(unsigned char *zl, int index, unsigned int num) {
     unsigned char *p = ziplistIndex(zl,index);
+#ifdef USE_NVM
+    return (p == NULL) ? zl : __ziplistDelete(zl,p,num, 1);
+#else
     return (p == NULL) ? zl : __ziplistDelete(zl,p,num);
+#endif
 }
+
+#ifdef USE_NVM
+unsigned char *ziplistDeleteRangeNoFreeNVM(unsigned char *zl, int index, unsigned int num) {
+    unsigned char *p = ziplistIndex(zl,index);
+    return (p == NULL) ? zl : __ziplistDelete(zl,p,num, 0);
+}
+#endif
 
 /* Compare entry pointer to by 'p' with 'sstr' of length 'slen'. */
 /* Return 1 if equal. */
@@ -1092,7 +1237,15 @@ unsigned int ziplistCompare(unsigned char *p, unsigned char *sstr, unsigned int 
         } else {
             return 0;
         }
-    } else {
+    }
+#ifdef USE_NVM
+    else if(entry.encoding == ZIP_NVM_PTR) {
+        assert(entry.len == sizeof(void*));
+        sds s = (*((void**)(p + entry.headersize)));
+        return sdslen(s) == slen && memcmp(s, sstr, slen) == 0;
+    }
+#endif
+    else {
         /* Try to compare encoded values. Don't compare encoding because
          * different implementations may encoded integers differently. */
         if (zipTryEncoding(sstr,slen,&sval,&sencoding)) {
@@ -1124,7 +1277,16 @@ unsigned char *ziplistFind(unsigned char *p, unsigned char *vstr, unsigned int v
                 if (len == vlen && memcmp(q, vstr, vlen) == 0) {
                     return p;
                 }
-            } else {
+            }
+#ifdef USE_NVM
+            else if(encoding == ZIP_NVM_PTR) {
+                assert(len == sizeof(void*));
+                sds s = (*((void**)q));
+                if(sdslen(s) == vlen && memcmp(s, vstr, vlen) == 0)
+                    return p;
+            }
+#endif
+            else {
                 /* Find out if the searched field can be encoded. Note that
                  * we do it only the first time, once done vencoding is set
                  * to non-zero and vll is set to the integer value. */
@@ -1244,6 +1406,28 @@ void ziplistRepr(unsigned char *zl) {
     }
     printf("{end}\n\n");
 }
+
+#ifdef USE_NVM
+void ziplistFree(unsigned char* zl)
+{
+    if(!zl)
+        return;
+    unsigned char* p = ZIPLIST_ENTRY_HEAD(zl);
+    while(p[0] != ZIP_END)
+    {
+        zlentry entry;
+        zipEntry(p, &entry);
+        if(entry.encoding == ZIP_NVM_PTR)
+        {
+            assert(entry.len == sizeof(void*));
+            sds s = (*((void**)(p + entry.headersize)));
+            sdsfree(s);
+        }
+        p += zipRawEntryLength(p);
+    }
+    zfree(zl);
+}
+#endif
 
 #ifdef REDIS_TEST
 #include <sys/time.h>

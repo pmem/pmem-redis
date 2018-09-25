@@ -1,5 +1,6 @@
 /* Configuration file parsing and CONFIG GET/SET commands implementation.
  *
+ * Copyright (c) 2018, Intel Corporation
  * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
  * All rights reserved.
  *
@@ -726,7 +727,60 @@ void loadServerConfigFromString(char *config) {
                 err = sentinelHandleConfiguration(argv+1,argc-1);
                 if (err) goto loaderr;
             }
-        } else {
+        }
+
+#ifdef USE_NVM
+        else if(!strcasecmp(argv[0], "nvm-maxcapacity")) {
+            if(argc != 2) {
+                err = "--nvm-maxcapacity <size>";
+                goto loaderr;
+            }
+            size_t size;
+            if(sscanf(argv[1], "%lu", &size) != 1 || size == 0) {
+                err = "wrong <size> in --nvm-maxcapacity";
+                goto loaderr;
+            }
+
+            size <<= 30;
+            server.nvm_size = size;
+        }
+        else if(!strcasecmp(argv[0], "nvm-dir")) {
+            if(argc != 2){
+                err = "--nvm-dir <device>";
+                goto loaderr;
+            }
+            server.nvm_dir = zstrdup(argv[1]);
+
+            if(server.nvm_size == 0){
+                err = "Please identify nvm-maxcapacity before set nvm-dir device!";
+                goto loaderr;
+            }
+        }
+        else if(!strcasecmp(argv[0], "nvm-threshold")) {
+            if(argc != 2) {
+                err = "--nvm-threshold <sds_length>";
+                goto loaderr;
+            }
+            if(sscanf(argv[1], "%lu", &(server.sdsmv_threshold)) != 1) {
+                err = "wrong <sds_length> in --nvm-threshold";
+                goto loaderr;
+            }
+        }
+#endif
+
+#ifdef SUPPORT_PBA
+        else if(strcasecmp(argv[0], "pointer-based-aof") == 0)
+        {
+            if(argc != 2)
+            {
+                err = "--pointer-based-aof <yes or no>";
+                goto loaderr;
+            }
+            server.pba.enable = strcasecmp(argv[1], "yes") == 0;
+        }
+#endif
+
+         else {
             err = "Bad directive or wrong number of arguments"; goto loaderr;
         }
         sdsfreesplitres(argv,argc);
@@ -739,8 +793,24 @@ void loadServerConfigFromString(char *config) {
         err = "slaveof directive not allowed in cluster mode";
         goto loaderr;
     }
-
     sdsfreesplitres(lines,totlines);
+
+#ifdef USE_AOFGUARD
+    if(server.nvm_dir && server.aof_state == AOF_ON && server.pba.enable)
+    {
+        server.aofguard.enable = 1;
+        if((server.aofguard.nvm_dir_fd = open(server.nvm_dir, O_DIRECTORY)) < 0)
+        {
+            serverLog(LL_WARNING, "open('%s', O_DIRECTORY) failed!", server.nvm_dir);
+            exit(1);
+        }
+        char filename[128];
+        sprintf(filename, "redis-%d.ag", server.port);
+        server.aofguard.nvm_file_name = zstrdup(filename);
+        server.aof_fsync = AOF_FSYNC_EVERYSEC; 
+    }
+#endif
+
     return;
 
 loaderr:
@@ -1128,7 +1198,8 @@ void configSetCommand(client *c) {
     /* Memory fields.
      * config_set_memory_field(name,var) */
     } config_set_memory_field("maxmemory",server.maxmemory) {
-        if (server.maxmemory) {
+        if (server.maxmemory
+                ) {
             if (server.maxmemory < zmalloc_used_memory()) {
                 serverLog(LL_WARNING,"WARNING: the new maxmemory value set via CONFIG SET is smaller than the current memory usage. This will result in keys eviction and/or inability to accept new write commands depending on the maxmemory-policy.");
             }
@@ -1152,6 +1223,11 @@ void configSetCommand(client *c) {
             (char*)c->argv[2]->ptr);
         return;
     }
+
+#ifdef USE_AOFGUARD
+    if(server.aofguard.enable)
+        server.aof_fsync = AOF_FSYNC_EVERYSEC;
+#endif
 
     /* On success we just return a generic OK for all the options. */
     addReply(c,shared.ok);
@@ -1319,8 +1395,20 @@ void configGetCommand(client *c) {
             server.verbosity,loglevel_enum);
     config_get_enum_field("supervised",
             server.supervised_mode,supervised_mode_enum);
+#ifdef USE_AOFGUARD
+    if(stringmatch(pattern, "appendfsync", 1))
+    {
+        addReplyBulkCString(c, "appendfsync");
+        if(server.aofguard.enable)
+            addReplyBulkCString(c, "NVM ring buffer");
+        else
+            addReplyBulkCString(c, configEnumGetNameOrUnknown(aof_fsync_enum, server.aof_fsync));
+        matches++;
+    }
+#else
     config_get_enum_field("appendfsync",
             server.aof_fsync,aof_fsync_enum);
+#endif
     config_get_enum_field("syslog-facility",
             server.syslog_facility,syslog_facility_enum);
 

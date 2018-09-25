@@ -132,6 +132,9 @@ void rioFreeFdset(rio *r);
 
 size_t rioWriteBulkCount(rio *r, char prefix, int count);
 size_t rioWriteBulkString(rio *r, const char *buf, size_t len);
+#ifdef SUPPORT_PBA
+size_t rioWriteBulkStringPBA(rio *r, const char *buf, size_t len);
+#endif
 size_t rioWriteBulkLongLong(rio *r, long long l);
 size_t rioWriteBulkDouble(rio *r, double d);
 

@@ -30,6 +30,9 @@
 
 #include "server.h"
 
+#ifdef USE_NVM
+#include "nvm.h"
+#endif
 /* -----------------------------------------------------------------------------
  * Helpers and low level bit functions.
  * -------------------------------------------------------------------------- */
@@ -544,6 +547,12 @@ void setbitCommand(client *c) {
 
     if ((o = lookupStringForBitCommand(c,bitoffset)) == NULL) return;
 
+#ifdef SUPPORT_PBA
+    int is_pba = server.aof_state == AOF_ON && server.pba.enable;
+    if(is_pba && o->encoding == OBJ_ENCODING_RAW && is_nvm_addr(o->ptr))
+        o->ptr = sdsmvtodram(o->ptr);
+#endif
+
     /* Get current values */
     byte = bitoffset >> 3;
     byteval = ((uint8_t*)o->ptr)[byte];
@@ -554,6 +563,21 @@ void setbitCommand(client *c) {
     byteval &= ~(1 << bit);
     byteval |= ((on & 0x1) << bit);
     ((uint8_t*)o->ptr)[byte] = byteval;
+
+#ifdef USE_NVM
+    if(o->encoding == OBJ_ENCODING_RAW && !is_nvm_addr(o->ptr)) {
+        o->ptr = sdsmvtonvm(o->ptr);
+    }
+#endif
+#ifdef SUPPORT_PBA
+    if(is_pba && o->encoding == OBJ_ENCODING_RAW && is_nvm_addr(o->ptr))
+    {
+        robj* set = createStringObject("SET", 3);
+        rewriteClientCommandVector(c, 3, set, c->argv[1], o);
+        decrRefCount(set);
+    }
+#endif
+
     signalModifiedKey(c->db,c->argv[1]);
     notifyKeyspaceEvent(NOTIFY_STRING,"setbit",c->argv[1],c->db->id);
     server.dirty++;

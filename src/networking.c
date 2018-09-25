@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2018, Intel Corporation
  * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
  * All rights reserved.
  *
@@ -1751,8 +1752,18 @@ void rewriteClientCommandVector(client *c, int argc, ...) {
     /* Replace argv and argc with our new versions. */
     c->argv = argv;
     c->argc = argc;
+
+#ifdef USE_NVM
+    if(argc > 0)
+    {
+        c->cmd = lookupCommandOrOriginal(c->argv[0]->ptr);
+        serverAssertWithInfo(c,NULL,c->cmd != NULL);
+    }
+#else
     c->cmd = lookupCommandOrOriginal(c->argv[0]->ptr);
     serverAssertWithInfo(c,NULL,c->cmd != NULL);
+#endif
+
     va_end(ap);
 }
 

@@ -72,7 +72,16 @@
 #define HAVE_DEFRAG
 #endif
 
+#ifdef USE_NVM
+#include "memkind.h"
+#endif
+
 void *zmalloc(size_t size);
+
+#ifdef USE_NVM
+void *s_zmalloc(size_t size);
+#endif
+
 void *zcalloc(size_t size);
 void *zrealloc(void *ptr, size_t size);
 void zfree(void *ptr);
@@ -85,6 +94,17 @@ size_t zmalloc_get_private_dirty(long pid);
 size_t zmalloc_get_smap_bytes_by_field(char *field, long pid);
 size_t zmalloc_get_memory_size(void);
 void zlibc_free(void *ptr);
+
+#ifdef USE_NVM
+void zmalloc_init_nvm(int (*_is_nvm_addr)(const void *),
+                      size_t (*_nvm_usable_size)(void*),
+                      void* (*_nvm_malloc)(size_t),
+                      int (*_nvm_free)(void*),
+                      size_t (*_nvm_get_used)(void)
+                     );
+
+void zmalloc_get_nvm_config(size_t sdsmv_threshold, struct memkind *pmem_kind);
+#endif
 
 #ifdef HAVE_DEFRAG
 void zfree_no_tcache(void *ptr);

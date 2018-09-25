@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2018, Intel Corporation
  * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
  * All rights reserved.
  *
@@ -29,6 +30,10 @@
 
 #include "server.h"
 
+#ifdef USE_NVM
+#include "nvm.h"
+#endif
+
 /*-----------------------------------------------------------------------------
  * Set Commands
  *----------------------------------------------------------------------------*/
@@ -55,7 +60,15 @@ int setTypeAdd(robj *subject, sds value) {
         dict *ht = subject->ptr;
         dictEntry *de = dictAddRaw(ht,value,NULL);
         if (de) {
+#ifdef USE_NVM
+            sds s = sdsdupnvm(value);
+            dictSetKey(ht,de,s);
+#ifdef SUPPORT_PBA
+            setArgPBA(s);
+#endif
+#else
             dictSetKey(ht,de,sdsdup(value));
+#endif
             dictSetVal(ht,de,NULL);
             return 1;
         }
@@ -73,10 +86,15 @@ int setTypeAdd(robj *subject, sds value) {
         } else {
             /* Failed to get integer from object, convert to regular set. */
             setTypeConvert(subject,OBJ_ENCODING_HT);
-
-            /* The set *was* an intset and this value is not integer
-             * encodable, so dictAdd should always work. */
+#ifdef USE_NVM
+            sds s = sdsdupnvm(value);
+            serverAssert(dictAdd(subject->ptr,s,NULL) == DICT_OK);
+#ifdef SUPPORT_PBA
+            setArgPBA(s);
+#endif
+#else
             serverAssert(dictAdd(subject->ptr,sdsdup(value),NULL) == DICT_OK);
+#endif
             return 1;
         }
     } else {
@@ -88,6 +106,17 @@ int setTypeAdd(robj *subject, sds value) {
 int setTypeRemove(robj *setobj, sds value) {
     long long llval;
     if (setobj->encoding == OBJ_ENCODING_HT) {
+#ifdef SUPPORT_PBA
+        /* only AOF is on and records NVM ptr */
+        if(IS_PBA() && server.pba.arg)
+        {
+            dictEntry* entry = dictFind(setobj->ptr, value);
+            if(!entry)
+                return 0;
+            sds s = dictGetKey(entry);
+            setArgPBA(s);
+        }
+#endif
         if (dictDelete(setobj->ptr,value) == DICT_OK) {
             if (htNeedsResize(setobj->ptr)) dictResize(setobj->ptr);
             return 1;
@@ -185,7 +214,11 @@ sds setTypeNextObject(setTypeIterator *si) {
         case OBJ_ENCODING_INTSET:
             return sdsfromlonglong(intele);
         case OBJ_ENCODING_HT:
+#ifdef USE_NVM
+            return sdsdupnvm(sdsele);
+#else
             return sdsdup(sdsele);
+#endif 
         default:
             serverPanic("Unsupported encoding");
     }
@@ -277,6 +310,9 @@ void saddCommand(client *c) {
     }
 
     for (j = 2; j < c->argc; j++) {
+#ifdef SUPPORT_PBA
+        server.pba.arg = c->argv[j];
+#endif
         if (setTypeAdd(set,c->argv[j]->ptr)) added++;
     }
     if (added) {
@@ -295,6 +331,9 @@ void sremCommand(client *c) {
         checkType(c,set,OBJ_SET)) return;
 
     for (j = 2; j < c->argc; j++) {
+#ifdef SUPPORT_PBA
+        server.pba.arg = c->argv[j];
+#endif
         if (setTypeRemove(set,c->argv[j]->ptr)) {
             deleted++;
             if (setTypeSize(set) == 0) {
@@ -339,11 +378,38 @@ void smoveCommand(client *c) {
         return;
     }
 
+#ifdef SUPPORT_PBA
+    int is_pba = IS_PBA();
+    if(is_pba)
+        server.pba.arg = createObject(OBJ_STRING, NULL);
+    robj* propargv[3];
+#endif
     /* If the element cannot be removed from the src set, return 0. */
     if (!setTypeRemove(srcset,ele->ptr)) {
         addReply(c,shared.czero);
+#ifdef SUPPORT_PBA
+        if(is_pba)
+            decrRefCount(server.pba.arg);
+#endif
         return;
     }
+
+#ifdef SUPPORT_PBA
+    if(is_pba)
+    {
+        propargv[0] = createStringObject("SREM", 4);
+        propargv[1] = c->argv[1];
+        if(server.pba.arg->ptr)
+            propargv[2] = server.pba.arg;
+        else
+            propargv[2] = ele;
+        alsoPropagate(server.sremCommand,c->db->id, propargv, 3, PROPAGATE_AOF);
+        decrRefCount(propargv[0]);
+        decrRefCount(server.pba.arg);
+        server.pba.arg = createObject(OBJ_STRING, NULL);
+    }
+#endif
+
     notifyKeyspaceEvent(NOTIFY_SET,"srem",c->argv[1],c->db->id);
 
     /* Remove the src set from the database when empty */
@@ -362,11 +428,30 @@ void smoveCommand(client *c) {
     signalModifiedKey(c->db,c->argv[2]);
     server.dirty++;
 
-    /* An extra key has changed when ele was successfully added to dstset */
     if (setTypeAdd(dstset,ele->ptr)) {
+#ifdef SUPPORT_PBA
+        if(is_pba)
+        {
+            propargv[0] = createStringObject("SADD", 4);
+            propargv[1] = c->argv[2];
+            if(server.pba.arg->ptr)
+                propargv[2] = server.pba.arg;
+            else
+                propargv[2] = ele;
+            alsoPropagate(server.pba.saddCommand,c->db->id, propargv, 3, PROPAGATE_AOF);
+            decrRefCount(propargv[0]);
+        }
+#endif
         server.dirty++;
         notifyKeyspaceEvent(NOTIFY_SET,"sadd",c->argv[2],c->db->id);
     }
+#ifdef SUPPORT_PBA
+    if(is_pba)
+    {
+        decrRefCount(server.pba.arg);
+        preventCommandAOF(c);
+    }
+#endif
     addReply(c,shared.cone);
 }
 
@@ -464,6 +549,10 @@ void spopWithCountCommand(client *c) {
     int64_t llele;
     unsigned long remaining = size-count; /* Elements left after SPOP. */
 
+#ifdef SUPPORT_PBA
+    int is_pba = IS_PBA();
+#endif
+
     /* If we are here, the number of requested elements is less than the
      * number of elements inside the set. Also we are sure that count < size.
      * Use two different strategies.
@@ -481,7 +570,17 @@ void spopWithCountCommand(client *c) {
                 set->ptr = intsetRemove(set->ptr,llele,NULL);
             } else {
                 addReplyBulkCBuffer(c,sdsele,sdslen(sdsele));
+#ifdef SUPPORT_PBA
+                if(is_pba && is_nvm_addr(sdsele))
+                {
+                    objele = createObject(OBJ_STRING, sdsele);
+                    objele->no_free_val = 1;
+                }
+                else
+                    objele = createStringObject(sdsele,sdslen(sdsele));
+#else
                 objele = createStringObject(sdsele,sdslen(sdsele));
+#endif
                 setTypeRemove(set,sdsele);
             }
 
@@ -529,7 +628,17 @@ void spopWithCountCommand(client *c) {
                 objele = createStringObjectFromLongLong(llele);
             } else {
                 addReplyBulkCBuffer(c,sdsele,sdslen(sdsele));
+#ifdef SUPPORT_PBA
+                if(is_pba && is_nvm_addr(sdsele))
+                {
+                    objele = createObject(OBJ_STRING, sdsele);
+                    objele->no_free_val = 1;
+                }
+                else
+                    objele = createStringObject(sdsele, sdslen(sdsele));
+#else
                 objele = createStringObject(sdsele,sdslen(sdsele));
+#endif
             }
 
             /* Replicate/AOF this command as an SREM operation */
@@ -566,6 +675,10 @@ void spopCommand(client *c) {
         return;
     }
 
+#ifdef SUPPORT_PBA
+    int is_pba = IS_PBA();
+#endif
+
     /* Make sure a key with the name inputted exists, and that it's type is
      * indeed a set */
     if ((set = lookupKeyWriteOrReply(c,c->argv[1],shared.nullbulk)) == NULL ||
@@ -580,6 +693,10 @@ void spopCommand(client *c) {
         set->ptr = intsetRemove(set->ptr,llele,NULL);
     } else {
         ele = createStringObject(sdsele,sdslen(sdsele));
+#ifdef SUPPORT_PBA
+        if(is_pba)
+            server.pba.arg = createObject(OBJ_STRING, NULL);
+#endif
         setTypeRemove(set,ele->ptr);
     }
 
@@ -587,12 +704,28 @@ void spopCommand(client *c) {
 
     /* Replicate/AOF this command as an SREM operation */
     aux = createStringObject("SREM",4);
+
+#ifdef SUPPORT_PBA
+    if(server.pba.arg && server.pba.arg->ptr)
+    {
+        serverAssert(is_nvm_addr(server.pba.arg->ptr));
+        rewriteClientCommandVector(c, 3, aux,c->argv[1], server.pba.arg);
+    }
+    else
+        rewriteClientCommandVector(c,3,aux,c->argv[1],ele);
+#else
     rewriteClientCommandVector(c,3,aux,c->argv[1],ele);
+#endif
     decrRefCount(aux);
 
     /* Add the element to the reply */
     addReplyBulk(c,ele);
     decrRefCount(ele);
+
+#ifdef SUPPORT_PBA
+    if(server.pba.arg)
+        decrRefCount(server.pba.arg);
+#endif
 
     /* Delete the set if it's empty */
     if (setTypeSize(set) == 0) {
@@ -702,7 +835,6 @@ void srandmemberWithCountCommand(client *c) {
         /* Remove random elements to reach the right count. */
         while(size > count) {
             dictEntry *de;
-
             de = dictGetRandomKey(d);
             dictDelete(d,dictGetKey(de));
             size--;
@@ -784,6 +916,43 @@ int qsortCompareSetsByRevCardinality(const void *s1, const void *s2) {
 
     return  (o2 ? setTypeSize(o2) : 0) - (o1 ? setTypeSize(o1) : 0);
 }
+
+#ifdef SUPPORT_PBA
+void propagateSetWithSADD(client* c, robj* set, int deleted)
+{
+    serverAssert(set->encoding == OBJ_ENCODING_HT);
+    robj *propargv[3];
+    propargv[1] = c->argv[1];
+    if(deleted)
+    {
+        propargv[0] = createStringObject("DEL", 3);
+        alsoPropagate(server.delCommand, c->db->id, propargv, 2, PROPAGATE_AOF);
+        decrRefCount(propargv[0]);
+    }
+    propargv[0] = createStringObject("SADD", 4);
+    dict* dict = set->ptr;
+    dictIterator* iter = dictGetIterator(dict);
+    dictEntry* entry;
+    while((entry = dictNext(iter)))
+    {
+        sds s = dictGetKey(entry);
+        robj* obj;
+        if(is_nvm_addr(s))
+        {
+            obj = createObject(OBJ_STRING, s);
+            obj->no_free_val = 1;
+        }
+        else
+            obj = createStringObject(s, sdslen(s));
+        propargv[2] = obj;
+        alsoPropagate(server.pba.saddCommand, c->db->id, propargv, 3, PROPAGATE_AOF);
+        decrRefCount(obj);
+    }
+    dictReleaseIterator(iter);
+    decrRefCount(propargv[0]);
+    preventCommandAOF(c);
+}
+#endif
 
 void sinterGenericCommand(client *c, robj **setkeys,
                           unsigned long setnum, robj *dstkey) {
@@ -904,6 +1073,10 @@ void sinterGenericCommand(client *c, robj **setkeys,
                 notifyKeyspaceEvent(NOTIFY_GENERIC,"del",
                     dstkey,c->db->id);
         }
+#ifdef SUPPORT_PBA
+        if(IS_PBA() && dstset->encoding == OBJ_ENCODING_HT)
+            propagateSetWithSADD(c, dstset, deleted);
+#endif
         signalModifiedKey(c->db,dstkey);
         server.dirty++;
     } else {
@@ -993,6 +1166,7 @@ void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum,
             if (!sets[j]) continue; /* non existing keys are like empty sets */
 
             si = setTypeInitIterator(sets[j]);
+            /*setTypeNextObject will duplicate the element sds, it is in DDR4*/
             while((ele = setTypeNextObject(si)) != NULL) {
                 if (setTypeAdd(dstset,ele)) cardinality++;
                 sdsfree(ele);
@@ -1078,6 +1252,10 @@ void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum,
                 notifyKeyspaceEvent(NOTIFY_GENERIC,"del",
                     dstkey,c->db->id);
         }
+#ifdef SUPPORT_PBA
+        if(IS_PBA() && dstset->encoding == OBJ_ENCODING_HT)
+            propagateSetWithSADD(c, dstset, deleted);
+#endif
         signalModifiedKey(c->db,dstkey);
         server.dirty++;
     }

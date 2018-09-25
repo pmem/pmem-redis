@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2018, Intel Corporation
  * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
  * All rights reserved.
  *
@@ -48,6 +49,7 @@
 #include <netinet/in.h>
 #include <lua.h>
 #include <signal.h>
+#include <stdarg.h>
 
 typedef long long mstime_t; /* millisecond time type. */
 
@@ -72,6 +74,33 @@ typedef long long mstime_t; /* millisecond time type. */
 #include "sha1.h"
 #include "endianconv.h"
 #include "crc64.h"
+
+#ifdef USE_NVM
+#include <memkind.h>
+#endif
+
+#ifdef AEP_COW
+#include "nvm_cow.h"
+#endif
+
+#ifdef SUPPORT_PBA
+#include <jemallocat.h>
+
+#define MEMKIND_PAGE_SIZE       4096
+#define MEMKIND_MAX_SMALL_SIZE  (224 << 10)
+#define PBA_SDS_MAX_LEN         (MEMKIND_MAX_SMALL_SIZE - 16)
+
+#define FREE_LIST_DELAY_MS      1000
+
+#define IS_PBA() (server.aof_state == AOF_ON && server.pba.enable)
+#define IS_EMBED_IN_ZIPLIST(p, zl) ((char*)(zl) < (char*)(p) && (char*)(p) < (char*)(zl) + ziplistBlobLen(zl))
+#endif
+
+#ifdef USE_AOFGUARD
+#include <aofguard.h>
+
+#define AOFGUARD_NVM_SIZE       (512 << 20)
+#endif
 
 /* Error codes */
 #define C_OK                    0
@@ -588,7 +617,14 @@ typedef struct redisObject {
                             * LFU data (least significant 8 bits frequency
                             * and most significant 16 bits decreas time). */
     int refcount;
-    void *ptr;
+#ifdef USE_NVM
+    unsigned need_mv_to_nvm: 1;
+#endif
+#ifdef SUPPORT_PBA
+    unsigned no_free_val: 1;
+#endif
+    void *ptr;          /*always the latest address*/
+
 } robj;
 
 /* Macro used to initialize a Redis object allocated on the stack.
@@ -612,7 +648,7 @@ typedef struct redisDb {
     dict *expires;              /* Timeout of keys with a timeout set */
     dict *blocking_keys;        /* Keys with clients waiting for data (BLPOP)*/
     dict *ready_keys;           /* Blocked keys that received a PUSH */
-    dict *watched_keys;         /* WATCHED keys for MULTI/EXEC CAS */
+    dict *watched_keys;         /* WATCHED keys for MULTI/EXEC CAS */    
     int id;                     /* Database ID */
     long long avg_ttl;          /* Average TTL, just for stats */
 } redisDb;
@@ -945,6 +981,9 @@ struct redisServer {
     long long stat_active_defrag_key_hits;  /* number of keys with moved allocations */
     long long stat_active_defrag_key_misses;/* number of keys scanned and not moved */
     size_t stat_peak_memory;        /* Max used memory record */
+#ifdef USE_NVM
+    size_t stat_peak_nvm;           /* Max used nvm record */
+#endif
     long long stat_fork_time;       /* Time needed to perform latest fork() */
     double stat_fork_rate;          /* Fork rate in GB/sec. */
     long long stat_rejected_conn;   /* Clients rejected because of maxclients */
@@ -1199,6 +1238,67 @@ struct redisServer {
     pthread_mutex_t lruclock_mutex;
     pthread_mutex_t next_client_id_mutex;
     pthread_mutex_t unixtime_mutex;
+
+#ifdef USE_NVM
+    char* nvm_dir;
+    char* nvm_base;
+    size_t nvm_size;
+    struct memkind *pmem_kind;
+    size_t sdsmv_threshold;
+#endif
+
+#ifdef AEP_COW
+    dict *forked_dict;         /*once bgsave, if new nvm address will be put into the forked dict. 
+                                if the address is not in the forked_dict, it means need to duplicate*/
+    dict *cow_dict;             /*duplicate address or the deleted address will be added into the cow_dict*/
+    size_t cow_nvm_size;
+    size_t cow_mem_size;
+    size_t last_nvm_cow_size;   /*cow_nvm_size + cow_mem_size*/
+#endif
+
+#ifdef SUPPORT_PBA
+    struct
+    {
+        int enable;
+        int loading;
+        struct redisCommand* setCommand;
+        struct redisCommand* saddCommand;
+        struct redisCommand* hsetCommand;
+        struct redisCommand* lsetCommand;
+        struct redisCommand* ldelCommand;
+        struct redisCommand* zaddCommand;
+        struct redisCommand* zremCommand;
+        robj* arg;
+        struct free_list
+        {
+            long long mstime;
+            void* ptr;
+            struct free_list* next;
+        }
+        *free_head, *free_tail;
+        struct jemallocat* jemallocat;
+        struct move_list
+        {
+            void* ptr;
+            size_t offset;
+            struct move_list* next;
+        }
+        *move_list;
+        int defrag_debug;
+    }
+    pba;
+#endif
+
+#ifdef USE_AOFGUARD
+    struct
+    {
+        int enable;
+        int nvm_dir_fd;
+        char* nvm_file_name;
+        struct aofguard* aofguard;
+    }
+    aofguard;
+#endif
 };
 
 typedef struct pubsubPattern {
@@ -1303,6 +1403,9 @@ extern dictType modulesDictType;
 /*-----------------------------------------------------------------------------
  * Functions prototypes
  *----------------------------------------------------------------------------*/
+#ifdef AEP_COW
+void * redisduplicatenvmaddr(void *addr);
+#endif
 
 /* Modules */
 void moduleInitModulesSystem(void);
@@ -1471,6 +1574,10 @@ int equalStringObjects(robj *a, robj *b);
 unsigned long long estimateObjectIdleTime(robj *o);
 #define sdsEncodedObject(objptr) (objptr->encoding == OBJ_ENCODING_RAW || objptr->encoding == OBJ_ENCODING_EMBSTR)
 
+#ifdef SUPPORT_PBA
+void setArgPBA(sds s);
+#endif
+
 /* Synchronous I/O with timeout */
 ssize_t syncWrite(int fd, char *ptr, ssize_t size, long long timeout);
 ssize_t syncRead(int fd, char *ptr, ssize_t size, long long timeout);
@@ -1629,6 +1736,9 @@ void adjustOpenFilesLimit(void);
 void closeListeningSockets(int unlink_unix_socket);
 void updateCachedTime(void);
 void resetServerStats(void);
+#ifdef SUPPORT_PBA
+int defragKey(redisDb *db, dictEntry *de);
+#endif
 void activeDefragCycle(void);
 unsigned int getLRUClock(void);
 unsigned int LRU_CLOCK(void);
@@ -1706,6 +1816,7 @@ void propagateExpire(redisDb *db, robj *key, int lazy);
 int expireIfNeeded(redisDb *db, robj *key);
 long long getExpire(redisDb *db, robj *key);
 void setExpire(client *c, redisDb *db, robj *key, long long when);
+
 robj *lookupKey(redisDb *db, robj *key, int flags);
 robj *lookupKeyRead(redisDb *db, robj *key);
 robj *lookupKeyWrite(redisDb *db, robj *key);
@@ -1857,6 +1968,9 @@ void rpushxCommand(client *c);
 void linsertCommand(client *c);
 void lpopCommand(client *c);
 void rpopCommand(client *c);
+#ifdef SUPPORT_PBA
+void ldelCommand(client *c);
+#endif
 void llenCommand(client *c);
 void lindexCommand(client *c);
 void lrangeCommand(client *c);

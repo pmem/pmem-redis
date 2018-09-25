@@ -1,10 +1,10 @@
 # Redis Makefile
+# Copyright (c) 2018, Intel Corporation
 # Copyright (C) 2009 Salvatore Sanfilippo <antirez at gmail dot com>
 # This file is released under the BSD license, see the COPYING file
 #
 # The Makefile composes the final FINAL_CFLAGS and FINAL_LDFLAGS using
-# what is needed for Redis plus the standard CFLAGS and LDFLAGS passed.
-# However when building the dependencies (Jemalloc, Lua, Hiredis, ...)
+# what is needed for Redis plus the standard CFLAGS and LDFLAGS passed.: However when building the dependencies (Jemalloc, Lua, Hiredis, ...)
 # CFLAGS and LDFLAGS are propagated to the dependencies, so to pass
 # flags only to be used when compiling / linking Redis itself REDIS_CFLAGS
 # and REDIS_LDFLAGS are used instead (this is the case of 'make gcov').
@@ -15,12 +15,12 @@
 release_hdr := $(shell sh -c './mkreleasehdr.sh')
 uname_S := $(shell sh -c 'uname -s 2>/dev/null || echo not')
 uname_M := $(shell sh -c 'uname -m 2>/dev/null || echo not')
-OPTIMIZATION?=-O2
+OPTIMIZATION?=-O3
 DEPENDENCY_TARGETS=hiredis linenoise lua
 NODEPS:=clean distclean
 
 # Default settings
-STD=-std=c99 -pedantic -DREDIS_STATIC=''
+STD=-std=gnu99 -pedantic -DREDIS_STATIC=''
 WARN=-Wall -W -Wno-missing-field-initializers
 OPT=$(OPTIMIZATION)
 
@@ -121,8 +121,36 @@ endif
 
 ifeq ($(MALLOC),jemalloc)
 	DEPENDENCY_TARGETS+= jemalloc
-	FINAL_CFLAGS+= -DUSE_JEMALLOC -I../deps/jemalloc/include
-	FINAL_LIBS+= ../deps/jemalloc/lib/libjemalloc.a
+	FINAL_CFLAGS+= -DUSE_JEMALLOC -I../deps/jemalloc_JE/include
+	FINAL_LIBS+= ../deps/jemalloc_JE/lib/libjemalloc.a
+	FINAL_CFLAGS+= -DJE_PREFIX=je_
+endif
+
+ifeq ($(USE_NVM),yes)
+	DEPENDENCY_TARGETS+= pmdk memkind
+	FINAL_CFLAGS+= -DUSE_NVM -I../deps/pmdk/src/include -I../deps/memkind/include
+	FINAL_LIBS+= ../deps/pmdk/src/nondebug/libpmem.a
+	FINAL_LIBS+= ../deps/jemalloc/obj/lib/libjemalloc.a ../deps/memkind/.libs/libmemkind.a
+	FINAL_LIBS+= -lnuma
+	AEP_COW = yes
+	SUPPORT_PBA = yes
+	USE_AOFGUARD = yes
+endif
+
+ifeq ($(AEP_COW),yes)
+	FINAL_CFLAGS += -DAEP_COW
+endif
+
+ifeq ($(SUPPORT_PBA),yes)
+	DEPENDENCY_TARGETS += jemallocat
+	FINAL_CFLAGS += -DSUPPORT_PBA -I../deps/jemallocat/include
+	FINAL_LIBS += ../deps/jemallocat/lib/libjemallocat.a
+endif
+
+ifeq ($(USE_AOFGUARD), yes)
+	DEPENDENCY_TARGETS += aofguard
+	FINAL_CFLAGS += -DUSE_AOFGUARD -I../deps/aofguard/include
+	FINAL_LIBS += ../deps/aofguard/lib/libaofguard.a
 endif
 
 REDIS_CC=$(QUIET_CC)$(CC) $(FINAL_CFLAGS)
@@ -135,6 +163,7 @@ SRCCOLOR="\033[33m"
 BINCOLOR="\033[37;1m"
 MAKECOLOR="\033[32;1m"
 ENDCOLOR="\033[0m"
+#V=a
 
 ifndef V
 QUIET_CC = @printf '    %b %b\n' $(CCCOLOR)CC$(ENDCOLOR) $(SRCCOLOR)$@$(ENDCOLOR) 1>&2;
@@ -144,15 +173,26 @@ endif
 
 REDIS_SERVER_NAME=redis-server
 REDIS_SENTINEL_NAME=redis-sentinel
-REDIS_SERVER_OBJ=adlist.o quicklist.o ae.o anet.o dict.o server.o sds.o zmalloc.o lzf_c.o lzf_d.o pqsort.o zipmap.o sha1.o ziplist.o release.o networking.o util.o object.o db.o replication.o rdb.o t_string.o t_list.o t_set.o t_zset.o t_hash.o config.o aof.o pubsub.o multi.o debug.o sort.o intset.o syncio.o cluster.o crc16.o endianconv.o slowlog.o scripting.o bio.o rio.o rand.o memtest.o crc64.o bitops.o sentinel.o notify.o setproctitle.o blocked.o hyperloglog.o latency.o sparkline.o redis-check-rdb.o redis-check-aof.o geo.o lazyfree.o module.o evict.o expire.o geohash.o geohash_helper.o childinfo.o defrag.o siphash.o rax.o
+REDIS_SERVER_OBJ=adlist.o quicklist.o ae.o anet.o dict.o server.o sds.o zmalloc.o lzf_c.o lzf_d.o pqsort.o zipmap.o sha1.o ziplist.o release.o networking.o util.o object.o db.o replication.o rdb.o t_string.o t_list.o t_set.o t_zset.o t_hash.o config.o aof.o pubsub.o multi.o debug.o sort.o intset.o syncio.o cluster.o crc16.o endianconv.o slowlog.o scripting.o bio.o rio.o rand.o memtest.o crc64.o bitops.o sentinel.o notify.o setproctitle.o blocked.o hyperloglog.o latency.o sparkline.o redis-check-rdb.o redis-check-aof.o geo.o lazyfree.o module.o evict.o expire.o geohash.o geohash_helper.o childinfo.o defrag.o siphash.o rax.o nvm.o
+
+ifeq ($(AEP_COW),yes)
+    REDIS_SERVER_OBJ += nvm_cow.o
+endif
+
 REDIS_CLI_NAME=redis-cli
 REDIS_CLI_OBJ=anet.o adlist.o redis-cli.o zmalloc.o release.o anet.o ae.o crc64.o
 REDIS_BENCHMARK_NAME=redis-benchmark
+REDIS_BENCHMARK_SEQ_NAME=redis-benchmark-seq
 REDIS_BENCHMARK_OBJ=ae.o anet.o redis-benchmark.o adlist.o zmalloc.o redis-benchmark.o
+REDIS_BENCHMARK_SEQ_OBJ=ae.o anet.o redis-benchmark-seq.o adlist.o zmalloc.o redis-benchmark-seq.o
 REDIS_CHECK_RDB_NAME=redis-check-rdb
 REDIS_CHECK_AOF_NAME=redis-check-aof
+#REDIS_CHECK_AOF_OBJ=redis-check-aof.o
 
-all: $(REDIS_SERVER_NAME) $(REDIS_SENTINEL_NAME) $(REDIS_CLI_NAME) $(REDIS_BENCHMARK_NAME) $(REDIS_CHECK_RDB_NAME) $(REDIS_CHECK_AOF_NAME)
+
+TARGETS = $(REDIS_SERVER_NAME) $(REDIS_CHECK_RDB_NAME) $(REDIS_BENCHMARK_NAME) $(REDIS_BENCHMARK_SEQ_NAME) $(REDIS_CLI_NAME) $(REDIS_CHECK_AOF_NAME)  $(REDIS_SENTINEL_NAME)
+
+all: $(TARGETS)
 	@echo ""
 	@echo "Hint: It's a good idea to run 'make test' ;)"
 	@echo ""
@@ -206,16 +246,21 @@ $(REDIS_SENTINEL_NAME): $(REDIS_SERVER_NAME)
 $(REDIS_CHECK_RDB_NAME): $(REDIS_SERVER_NAME)
 	$(REDIS_INSTALL) $(REDIS_SERVER_NAME) $(REDIS_CHECK_RDB_NAME)
 
-# redis-check-aof
+#$(REDIS_CHECK_AOF_NAME): $(REDIS_CHECK_AOF_OBJ)	
+
 $(REDIS_CHECK_AOF_NAME): $(REDIS_SERVER_NAME)
 	$(REDIS_INSTALL) $(REDIS_SERVER_NAME) $(REDIS_CHECK_AOF_NAME)
 
 # redis-cli
 $(REDIS_CLI_NAME): $(REDIS_CLI_OBJ)
-	$(REDIS_LD) -o $@ $^ ../deps/hiredis/libhiredis.a ../deps/linenoise/linenoise.o $(FINAL_LIBS)
+	$(REDIS_LD) -o $@ $^ ../deps/hiredis/libhiredis.a ../deps/linenoise/linenoise.o $(filter-out -lpmem, $(filter-out -lmemkind, $(FINAL_LIBS)))
 
 # redis-benchmark
 $(REDIS_BENCHMARK_NAME): $(REDIS_BENCHMARK_OBJ)
+	$(REDIS_LD) -o $@ $^ ../deps/hiredis/libhiredis.a $(filter-out -lpmem, $(filter-out -lmemkind, $(FINAL_LIBS)))
+
+# redis-benchmark-seq
+$(REDIS_BENCHMARK_SEQ_NAME): $(REDIS_BENCHMARK_SEQ_OBJ)
 	$(REDIS_LD) -o $@ $^ ../deps/hiredis/libhiredis.a $(FINAL_LIBS)
 
 dict-benchmark: dict.c zmalloc.c sds.c siphash.c
@@ -228,7 +273,7 @@ dict-benchmark: dict.c zmalloc.c sds.c siphash.c
 	$(REDIS_CC) -c $<
 
 clean:
-	rm -rf $(REDIS_SERVER_NAME) $(REDIS_SENTINEL_NAME) $(REDIS_CLI_NAME) $(REDIS_BENCHMARK_NAME) $(REDIS_CHECK_RDB_NAME) $(REDIS_CHECK_AOF_NAME) *.o *.gcda *.gcno *.gcov redis.info lcov-html Makefile.dep dict-benchmark
+	rm -rf $(REDIS_SERVER_NAME) $(REDIS_SENTINEL_NAME) $(REDIS_CLI_NAME) $(REDIS_BENCHMARK_NAME) $(REDIS_BENCHMARK_SEQ_NAME) $(REDIS_CHECK_RDB_NAME) $(REDIS_CHECK_AOF_NAME) *.o *.gcda *.gcno *.gcov redis.info lcov-html Makefile.dep dict-benchmark
 
 .PHONY: clean
 

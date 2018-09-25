@@ -39,4 +39,10 @@ void bioKillThreads(void);
 #define BIO_CLOSE_FILE    0 /* Deferred close(2) syscall. */
 #define BIO_AOF_FSYNC     1 /* Deferred AOF fsync. */
 #define BIO_LAZY_FREE     2 /* Deferred objects freeing. */
+
+#ifdef USE_AOFGUARD
+#define BIO_DEINIT_AOFGUARD 3
+#define BIO_NUM_OPS         4
+#else
 #define BIO_NUM_OPS       3
+#endif

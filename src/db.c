@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2018, Intel Corporation
  * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
  * All rights reserved.
  *
@@ -66,6 +67,7 @@ robj *lookupKey(redisDb *db, robj *key, int flags) {
         return NULL;
     }
 }
+
 
 /* Lookup a key for read operations, or return NULL if the key is not found
  * in the specified DB.
@@ -158,7 +160,12 @@ robj *lookupKeyWriteOrReply(client *c, robj *key, robj *reply) {
  *
  * The program is aborted if the key already exists. */
 void dbAdd(redisDb *db, robj *key, robj *val) {
+#ifdef USE_NVM
+    sds copy = sdsdupnvm(key->ptr);
+#else
     sds copy = sdsdup(key->ptr);
+#endif
+    
     int retval = dictAdd(db->dict, copy, val);
 
     serverAssertWithInfo(NULL,key,retval == DICT_OK);

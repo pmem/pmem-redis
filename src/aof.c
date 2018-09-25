@@ -40,6 +40,11 @@
 #include <sys/wait.h>
 #include <sys/param.h>
 
+#ifdef SUPPORT_PBA
+#include "nvm.h"
+#include <libpmem.h>
+#endif
+
 void aofUpdateCurrentSize(void);
 void aofClosePipes(void);
 
@@ -323,7 +328,22 @@ void flushAppendOnlyFile(int force) {
      * or alike */
 
     latencyStartMonitor(latency);
+#ifdef USE_AOFGUARD
+    if(server.aofguard.enable)
+    {
+        size_t aof_buf_len = sdslen(server.aof_buf);
+        if(!aofguard_write(server.aofguard.aofguard, server.aof_buf, aof_buf_len))
+        {
+            serverLog(LL_WARNING, "aofguard_write(server.aofguard.aofguard, server.aof_buf, %lu) failed!", aof_buf_len);
+            exit(1);
+        }
+        nwritten = aof_buf_len;
+    }
+    else
+        nwritten = write(server.aof_fd,server.aof_buf,sdslen(server.aof_buf));
+#else
     nwritten = write(server.aof_fd,server.aof_buf,sdslen(server.aof_buf));
+#endif
     latencyEndMonitor(latency);
     /* We want to capture different events for delayed writes:
      * when the delay happens with a pending fsync, or with a saving child
@@ -447,7 +467,11 @@ void flushAppendOnlyFile(int force) {
     }
 }
 
+#ifdef SUPPORT_PBA
+sds catAppendOnlyGenericCommand(sds dst, int argc, robj **argv, struct redisCommand* cmd) {
+#else
 sds catAppendOnlyGenericCommand(sds dst, int argc, robj **argv) {
+#endif
     char buf[32];
     int len, j;
     robj *o;
@@ -458,8 +482,76 @@ sds catAppendOnlyGenericCommand(sds dst, int argc, robj **argv) {
     buf[len++] = '\n';
     dst = sdscatlen(dst,buf,len);
 
+#ifdef SUPPORT_PBA
+    unsigned char is_value[argc];
+    memset(is_value, 1, argc);
+    is_value[0] = 0;
+    if(cmd->getkeys_proc) /* if this command has itw own getkeys_proc(), use it to get keys */
+    {
+        int count;
+        int* key_indexs = cmd->getkeys_proc(cmd, argv, argc, &count);
+        if(key_indexs)
+        {
+            for(int i = 0; i < count; i++)
+                is_value[key_indexs[i]] = 0;
+            zfree(key_indexs);
+        }
+    }
+    else if(cmd->firstkey)   /* if no getkeys_proc(), use the command method to get keys */
+    {
+        serverAssert(cmd->lastkey != 0);
+        serverAssert(cmd->keystep > 0);
+        int lastkey = cmd->lastkey > 0 ? cmd->lastkey : argc + cmd->lastkey;
+        serverAssert(lastkey >= cmd->firstkey);
+        for(int i = cmd->firstkey; i <= lastkey; i += cmd->keystep)
+            is_value[i] = 0;
+    }
+#endif
+
     for (j = 0; j < argc; j++) {
+#ifdef SUPPORT_PBA
+        o = NULL;
+        if(server.pba.enable && is_value[j])
+        {
+            o = argv[j];
+            /* if is on NVM, format is "@<offset>"*/
+            if(o->encoding == OBJ_ENCODING_RAW && is_nvm_addr(o->ptr) && sdslen(o->ptr) <= PBA_SDS_MAX_LEN)
+            {
+                size_t offset = (char*)o->ptr - (char*)server.nvm_base;
+                char offset_buf[32];
+                offset_buf[0] = '@';
+                sprintf(offset_buf + 1, "%lx", offset);
+                size_t offset_buf_len = strlen(offset_buf);
+                buf[0] = '$';
+                len = 1 + ll2string(buf + 1, sizeof(buf) - 1, offset_buf_len);
+                buf[len++] = '\r';
+                buf[len++] = '\n';
+                dst = sdscatlen(dst, buf, len);
+                dst = sdscatlen(dst, offset_buf, offset_buf_len);
+                dst = sdscatlen(dst, "\r\n", 2);
+                continue;
+            }
+            o = getDecodedObject(argv[j]);
+            sds s = o->ptr;
+            if(s[0] == '@' || s[0] == '#')
+            {
+                buf[0] = '$';
+                len = 1 + ll2string(buf + 1, sizeof(buf) - 1, 1 + sdslen(s));
+                buf[len++] = '\r';
+                buf[len++] = '\n';
+                buf[len++] = '#';
+                dst = sdscatlen(dst, buf, len);
+                dst = sdscatlen(dst, s, sdslen(s));
+                dst = sdscatlen(dst, "\r\n", 2);
+                decrRefCount(o);
+                continue;
+            }
+        }
+        if(!o)
+            o = getDecodedObject(argv[j]);
+#else
         o = getDecodedObject(argv[j]);
+#endif
         buf[0] = '$';
         len = 1+ll2string(buf+1,sizeof(buf)-1,sdslen(o->ptr));
         buf[len++] = '\r';
@@ -503,7 +595,11 @@ sds catAppendOnlyExpireAtCommand(sds buf, struct redisCommand *cmd, robj *key, r
     argv[0] = createStringObject("PEXPIREAT",9);
     argv[1] = key;
     argv[2] = createStringObjectFromLongLong(when);
+#ifdef SUPPORT_PBA
+    buf = catAppendOnlyGenericCommand(buf, 3, argv, cmd);
+#else
     buf = catAppendOnlyGenericCommand(buf, 3, argv);
+#endif
     decrRefCount(argv[0]);
     decrRefCount(argv[2]);
     return buf;
@@ -533,14 +629,22 @@ void feedAppendOnlyFile(struct redisCommand *cmd, int dictid, robj **argv, int a
         tmpargv[0] = createStringObject("SET",3);
         tmpargv[1] = argv[1];
         tmpargv[2] = argv[3];
+#ifdef SUPPORT_PBA
+        buf = catAppendOnlyGenericCommand(buf,3,tmpargv, cmd);
+#else
         buf = catAppendOnlyGenericCommand(buf,3,tmpargv);
+#endif
         decrRefCount(tmpargv[0]);
         buf = catAppendOnlyExpireAtCommand(buf,cmd,argv[1],argv[2]);
     } else if (cmd->proc == setCommand && argc > 3) {
         int i;
         robj *exarg = NULL, *pxarg = NULL;
         /* Translate SET [EX seconds][PX milliseconds] to SET and PEXPIREAT */
+#ifdef SUPPORT_PBA
+        buf = catAppendOnlyGenericCommand(buf,3,argv, cmd);
+#else
         buf = catAppendOnlyGenericCommand(buf,3,argv);
+#endif
         for (i = 3; i < argc; i ++) {
             if (!strcasecmp(argv[i]->ptr, "ex")) exarg = argv[i+1];
             if (!strcasecmp(argv[i]->ptr, "px")) pxarg = argv[i+1];
@@ -556,7 +660,11 @@ void feedAppendOnlyFile(struct redisCommand *cmd, int dictid, robj **argv, int a
         /* All the other commands don't need translation or need the
          * same translation already operated in the command vector
          * for the replication itself. */
+#ifdef SUPPORT_PBA
+        buf = catAppendOnlyGenericCommand(buf,argc,argv, cmd);
+#else
         buf = catAppendOnlyGenericCommand(buf,argc,argv);
+#endif
     }
 
     /* Append to the AOF buffer. This will be flushed on disk just before
@@ -624,6 +732,354 @@ void freeFakeClient(struct client *c) {
     zfree(c);
 }
 
+#ifdef SUPPORT_PBA
+void addSdsToMoveListPBA(sds* psds)
+{
+    if(!server.nvm_base)
+        return;
+    sds s = (*psds);
+    if(is_nvm_addr(s))
+        return;
+    size_t header_size = sdsheadersize(s);
+    size_t total_size = header_size + sdsalloc(s) + 1;
+    if(total_size < server.sdsmv_threshold)
+        return;
+    struct move_list* node = zmalloc(sizeof(struct move_list));
+    node->ptr = psds;
+    node->offset = header_size;
+    node->next = server.pba.move_list;
+    server.pba.move_list = node;
+}
+
+void addZiplistToMoveListPBA(unsigned char** pzl)
+{
+    if(!server.nvm_base)
+        return;
+    unsigned char* zl = (*pzl);
+    if(is_nvm_addr(zl))
+        return;
+    size_t len = ziplistBlobLen(zl);
+    if(len < server.sdsmv_threshold)
+        return;
+    struct move_list* node = zmalloc(sizeof(struct move_list));
+    node->ptr = pzl;
+    node->offset = 0;
+    node->next = server.pba.move_list;
+    server.pba.move_list = node;
+}
+
+sds resolvePBASds(sds raw)
+{
+    size_t len = sdslen(raw);
+    if(!len)
+        return raw;
+    /* if start with '#', the string after '#' is the real content */
+    if(raw[0] == '#')
+        return sdsnewlen(raw + 1, len - 1);
+    /* if start with neither '@' nor '#', return itself */
+    else if(raw[0] != '@')
+        return raw;
+    /* here, raw starts with '@' */
+    if(!server.pba.jemallocat)
+    {
+        serverLog(LL_WARNING, "PBA need NVM enabled!");
+        exit(1);
+    }
+    size_t offset;
+    if(sscanf(raw + 1, "%lx", &offset) != 1)
+    {
+        serverLog(LL_WARNING, "wrong NVM pointer: '%s'", raw);
+        exit(1);
+    }
+    if(offset >= server.nvm_size)
+    {
+        serverLog(LL_WARNING, "NVM pointer is out of range: '%s'", raw);
+        exit(1);
+    }
+    /* point to NVM */
+    sds s = (char*)server.nvm_base + offset;
+    size_t header_size = sdsheadersize(s);
+    size_t total_size = header_size + sdsalloc(s) + 1;
+    serverAssert(offset >= header_size);
+    size_t sh_offset = offset - header_size;
+    if(!jemallocat_add(server.pba.jemallocat, sh_offset, total_size))
+    {
+        serverLog(LL_WARNING, "jemallocat_add(server.pba.jemallocat, %lu, %lu) failed!", sh_offset, total_size);
+        exit(1);
+    }
+    return s;
+}
+
+robj* resolvePBAString(robj* o)
+{
+    if(!(o->encoding == OBJ_ENCODING_RAW || o->encoding == OBJ_ENCODING_EMBSTR))
+        return o;
+    sds raw = o->ptr;
+    sds s = resolvePBASds(raw);
+    if(s != raw)
+    {
+        decrRefCount(o);
+        o = createObject(OBJ_STRING, s);
+    }
+    addSdsToMoveListPBA((void*)(&(o->ptr)));
+    return o;
+}
+
+robj* resolvePBASet(robj* o)
+{
+    if(o->encoding == OBJ_ENCODING_INTSET)
+        return o;
+    serverAssert(o->encoding == OBJ_ENCODING_HT);
+    dict* old_dict = o->ptr;
+    dict* new_dict = dictCreate(&setDictType, NULL);
+    /* Presize the dict to avoid rehashing */
+    dictExpand(new_dict, dictSize(old_dict));
+    dictIterator* iter = dictGetIterator(old_dict);
+    dictEntry* entry;
+    while((entry = dictNext(iter)))
+    {
+        sds raw = dictGetKey(entry);
+        sds s = resolvePBASds(raw);
+        dictAdd(new_dict, s, NULL);
+        if(s == raw)
+            dictSetKey(old_dict, entry, NULL);
+    }
+    dictReleaseIterator(iter);
+    dictRelease(old_dict);
+    o->ptr = new_dict;
+    return o;
+}
+
+robj* resolvePBAHash(robj* o)
+{
+    dict* new_dict = dictCreate(&hashDictType, NULL);
+    hashTypeIterator* iter = hashTypeInitIterator(o);
+    while(hashTypeNext(iter) != C_ERR)
+    {
+        sds raw = hashTypeCurrentObjectNewSds(iter, OBJ_HASH_KEY);
+        sds field = resolvePBASds(raw);
+        if(field != raw)
+            sdsfree(raw);
+        raw = hashTypeCurrentObjectNewSds(iter, OBJ_HASH_VALUE);
+        sds value = resolvePBASds(raw);
+        if(value != raw)
+            sdsfree(raw);
+        dictAdd(new_dict, field, value);
+    }
+    hashTypeReleaseIterator(iter);
+    decrRefCount(o);
+    o = createObject(OBJ_HASH, new_dict);
+    o->encoding = OBJ_ENCODING_HT;
+    return o;
+}
+
+robj* resolvePBAList(robj* o)
+{
+    robj* new_list = createQuicklistObject();
+    quicklistSetOptions(new_list->ptr, server.list_max_ziplist_size,
+        server.list_compress_depth);
+    listTypeIterator* iter = listTypeInitIterator(o, 0, LIST_TAIL);
+    listTypeEntry entry;
+    while(listTypeNext(iter, &entry))
+    {
+        if(entry.entry.value)
+        {
+            sds raw = sdsnewlen((char*)entry.entry.value, entry.entry.sz);
+            sds s = resolvePBASds(raw);
+            if(s != raw)
+                sdsfree(raw);
+            quicklistPush(new_list->ptr, s, sdslen(s), QUICKLIST_TAIL);
+            if(!is_nvm_addr(s))
+                sdsfree(s);
+        }
+        else
+        {
+            sds s = sdsfromlonglong(entry.entry.longval);
+            quicklistPush(new_list->ptr, s, sdslen(s), QUICKLIST_TAIL);
+            sdsfree(s);
+        }
+    }
+    listTypeReleaseIterator(iter);
+    decrRefCount(o);
+    quicklistNode *node = ((quicklist*)new_list->ptr)->head;
+    while(node)
+    {
+        addZiplistToMoveListPBA((void*)(&(node->zl)));
+        node = node->next;
+    }
+    return new_list;
+}
+
+robj* resolvePBAZset(robj* o)
+{
+    robj* new_zset = createZsetObject();
+    struct zset* z = new_zset->ptr;
+    if(o->encoding == OBJ_ENCODING_ZIPLIST)
+    {
+        unsigned char *zl = o->ptr;
+        unsigned char* eptr = ziplistIndex(zl, 0);
+        unsigned char* sptr = ziplistNext(zl, eptr);
+        while(eptr)
+        {
+            unsigned char *vstr = NULL;
+            unsigned int vlen;
+            long long vlong;
+            ziplistGet(eptr, &vstr, &vlen, &vlong);
+            sds ele;
+            if(vstr)
+            {
+                sds raw = sdsnewlen((char*)vstr, vlen);
+                ele = resolvePBASds(raw);
+                if(ele != raw)
+                    sdsfree(raw);
+            }
+            else
+                ele = sdsfromlonglong(vlong);
+            double score = zzlGetScore(sptr);
+            zskiplistNode* znode = zslInsert(z->zsl, score, ele);
+            dictAdd(z->dict, ele, &(znode->score));
+            zzlNext(zl,&eptr,&sptr);
+        }
+    }
+    else if(o->encoding == OBJ_ENCODING_SKIPLIST)
+    {
+        dictIterator* iter = dictGetIterator(((struct zset*)(o->ptr))->dict);
+        dictEntry* entry;
+        while((entry = dictNext(iter)))
+        {
+            sds raw = dictGetKey(entry);
+            sds ele = resolvePBASds(raw);
+            if(ele == raw)
+                ele = sdsdup(raw);
+            double score = (*((double*)dictGetVal(entry)));
+            zskiplistNode* znode = zslInsert(z->zsl, score, ele);
+            dictAdd(z->dict, ele, &(znode->score));
+        }
+        dictReleaseIterator(iter);
+    }
+    decrRefCount(o);
+    return new_zset;
+}
+
+void* jemallocat_memkind_base_addr(void* udata)
+{
+    UNUSED(udata);
+    return server.nvm_base;
+}
+
+void* jemallocat_memkind_malloc(void* udata, size_t size)
+{
+    UNUSED(udata);
+    return nvm_malloc(size);
+}
+
+void jemallocat_memkind_free(void* udata, void* ptr)
+{
+    UNUSED(udata);
+    nvm_free(ptr);
+}
+
+size_t jemallocat_memkind_standardize_size(void* udata, size_t size)
+{
+    UNUSED(udata);
+    serverAssert(size <= (4 << 20));
+    if(size <= 8)
+        return 8;
+    for(size_t upper = 128; upper <= (4 << 20); upper *= 2)
+    {
+        if(size <= upper)
+        {
+            size_t step = upper / 8;
+            size_t std_size = (((size - 1) / step) + 1) * step;
+            return std_size;
+        }
+    }
+    serverAssert(0);
+    return 0;
+}
+
+int jemallocat_memkind_is_page_allocatable(void* udata, size_t index)
+{
+    UNUSED(udata);
+    if(index % 512 < 13)
+        return 0;
+    return 1;
+}
+
+void resolvePBA()
+{
+    if(server.nvm_base)
+    {
+        struct jemallocat jemallocat;
+        server.pba.jemallocat = &jemallocat;
+        if(!jemallocat_init(&jemallocat, server.nvm_size, MEMKIND_PAGE_SIZE, MEMKIND_MAX_SMALL_SIZE,
+            server.pmem_kind,
+            jemallocat_memkind_base_addr,
+            jemallocat_memkind_malloc,
+            jemallocat_memkind_free,
+            jemallocat_memkind_standardize_size,
+            jemallocat_memkind_is_page_allocatable))
+            serverPanic("jemallocat_init() failed!");
+    }
+    else
+        server.pba.jemallocat = 0;
+    for(int i = 0; i < server.dbnum; i++)
+    {
+        dict* dict = server.db[i].dict;
+        dictIterator* iter = dictGetIterator(dict);
+        dictEntry* entry;
+        while((entry = dictNext(iter)))
+        {
+            addSdsToMoveListPBA((void*)(&(entry->key)));
+            robj* obj = dictGetVal(entry);
+            robj* resolved_obj = NULL;
+            switch(obj->type)
+            {
+                case OBJ_STRING:
+                    resolved_obj = resolvePBAString(obj);
+                    break;
+                case OBJ_SET:
+                    resolved_obj = resolvePBASet(obj);
+                    break;
+                case OBJ_HASH:
+                    resolved_obj = resolvePBAHash(obj);
+                    break;
+                case OBJ_LIST:
+                    resolved_obj = resolvePBAList(obj);
+                    break;
+                case OBJ_ZSET:
+                    resolved_obj = resolvePBAZset(obj);
+                    break;
+                default:
+                    resolved_obj = obj;
+            }
+            serverAssert(resolved_obj);
+            if(resolved_obj != obj)
+                dictSetVal(dict, entry, resolved_obj);
+        }
+        dictReleaseIterator(iter);
+    }
+    server.pba.loading = 0;
+    if(server.pba.jemallocat && !jemallocat_finish(server.pba.jemallocat))
+        serverPanic("jemalloc_finish() failed");
+    while(server.pba.move_list)
+    {
+        struct move_list* node = server.pba.move_list;
+        server.pba.move_list = node->next;
+        char* addr = (*((char**)node->ptr)) - node->offset;
+        size_t size = zmalloc_size(addr);
+        char* ptr = nvm_malloc(size);
+        if(ptr)
+        {
+            pmem_memcpy_persist(ptr, addr, size);
+            (*((char**)node->ptr)) = ptr + node->offset;
+            zfree(addr);
+        }
+        zfree(node);
+    }
+}
+#endif
+
 /* Replay the append log file. On success C_OK is returned. On non fatal
  * error (the append only file is zero-length) C_ERR is returned. On
  * fatal error an error message is logged and the program exists. */
@@ -656,6 +1112,11 @@ int loadAppendOnlyFile(char *filename) {
 
     fakeClient = createFakeClient();
     startLoading(fp);
+
+#ifdef SUPPORT_PBA
+    if(server.pba.enable)
+        server.pba.loading = 1;
+#endif
 
     /* Check if this AOF file has an RDB preamble. In that case we need to
      * load the RDB file and later continue loading the AOF tail. */
@@ -741,7 +1202,9 @@ int loadAppendOnlyFile(char *filename) {
         /* Run the command in the context of a fake client */
         fakeClient->cmd = cmd;
         cmd->proc(fakeClient);
-
+#ifdef SUPPORT_PBA
+        server.pba.arg = 0;
+#endif
         /* The fake client should not have a reply */
         serverAssert(fakeClient->bufpos == 0 && listLength(fakeClient->reply) == 0);
         /* The fake client should never get blocked */
@@ -765,6 +1228,10 @@ loaded_ok: /* DB loaded, cleanup and return C_OK to the caller. */
     stopLoading();
     aofUpdateCurrentSize();
     server.aof_rewrite_base_size = server.aof_current_size;
+#ifdef SUPPORT_PBA
+    if(server.pba.enable)
+        resolvePBA();
+#endif
     return C_OK;
 
 readerr: /* Read error. If feof(fp) is true, fall through to unexpected EOF. */
@@ -827,6 +1294,20 @@ int rioWriteBulkObject(rio *r, robj *obj) {
     }
 }
 
+#ifdef SUPPORT_PBA
+int rioWriteBulkObjectPBA(rio *r, robj *obj) {
+    /* Avoid using getDecodedObject to help copy-on-write (we are often
+ *      * in a child process when this function is called). */
+    if (obj->encoding == OBJ_ENCODING_INT) {
+        return rioWriteBulkLongLong(r,(long)obj->ptr);
+    } else if (sdsEncodedObject(obj)) {
+        return rioWriteBulkStringPBA(r,obj->ptr,sdslen(obj->ptr));
+    } else {
+        serverPanic("Unknown string encoding");
+    }
+}
+#endif
+
 /* Emit the commands needed to rebuild a list object.
  * The function returns 0 on error, 1 on success. */
 int rewriteListObject(rio *r, robj *key, robj *o) {
@@ -847,7 +1328,17 @@ int rewriteListObject(rio *r, robj *key, robj *o) {
             }
 
             if (entry.value) {
+#ifdef SUPPORT_PBA
+                sds value = NULL;
+                if(is_nvm_addr(entry.value) && IS_EMBED_IN_ZIPLIST(entry.value, entry.node->zl))
+                    value = sdsnewlen((char*)entry.value, entry.sz);
+                if(rioWriteBulkStringPBA(r, value ? value : (char*)entry.value, entry.sz) == 0)
+                    return 0;
+                if(value)
+                    sdsfree(value);
+#else
                 if (rioWriteBulkString(r,(char*)entry.value,entry.sz) == 0) return 0;
+#endif
             } else {
                 if (rioWriteBulkLongLong(r,entry.longval) == 0) return 0;
             }
@@ -897,7 +1388,11 @@ int rewriteSetObject(rio *r, robj *key, robj *o) {
                 if (rioWriteBulkString(r,"SADD",4) == 0) return 0;
                 if (rioWriteBulkObject(r,key) == 0) return 0;
             }
+#ifdef SUPPORT_PBA
+            if (rioWriteBulkStringPBA(r,ele,sdslen(ele)) == 0) return 0;
+#else
             if (rioWriteBulkString(r,ele,sdslen(ele)) == 0) return 0;
+#endif
             if (++count == AOF_REWRITE_ITEMS_PER_CMD) count = 0;
             items--;
         }
@@ -940,7 +1435,11 @@ int rewriteSortedSetObject(rio *r, robj *key, robj *o) {
             }
             if (rioWriteBulkDouble(r,score) == 0) return 0;
             if (vstr != NULL) {
+#ifdef SUPPORT_PBA
+                if (rioWriteBulkStringPBA(r,(char*)vstr,vlen) == 0) return 0;
+#else
                 if (rioWriteBulkString(r,(char*)vstr,vlen) == 0) return 0;
+#endif
             } else {
                 if (rioWriteBulkLongLong(r,vll) == 0) return 0;
             }
@@ -966,7 +1465,11 @@ int rewriteSortedSetObject(rio *r, robj *key, robj *o) {
                 if (rioWriteBulkObject(r,key) == 0) return 0;
             }
             if (rioWriteBulkDouble(r,*score) == 0) return 0;
+#ifdef SUPPORT_PBA
+            if (rioWriteBulkStringPBA(r,ele,sdslen(ele)) == 0) return 0;
+#else
             if (rioWriteBulkString(r,ele,sdslen(ele)) == 0) return 0;
+#endif
             if (++count == AOF_REWRITE_ITEMS_PER_CMD) count = 0;
             items--;
         }
@@ -991,12 +1494,20 @@ static int rioWriteHashIteratorCursor(rio *r, hashTypeIterator *hi, int what) {
 
         hashTypeCurrentFromZiplist(hi, what, &vstr, &vlen, &vll);
         if (vstr)
+#ifdef SUPPORT_PBA
+            return rioWriteBulkStringPBA(r, (char*)vstr, vlen);
+#else
             return rioWriteBulkString(r, (char*)vstr, vlen);
+#endif
         else
             return rioWriteBulkLongLong(r, vll);
     } else if (hi->encoding == OBJ_ENCODING_HT) {
         sds value = hashTypeCurrentFromHashTable(hi, what);
+#ifdef SUPPORT_PBA
+        return rioWriteBulkStringPBA(r, value, sdslen(value));
+#else
         return rioWriteBulkString(r, value, sdslen(value));
+#endif
     }
 
     serverPanic("Unknown hash encoding");
@@ -1102,7 +1613,11 @@ int rewriteAppendOnlyFileRio(rio *aof) {
                 if (rioWrite(aof,cmd,sizeof(cmd)-1) == 0) goto werr;
                 /* Key and value */
                 if (rioWriteBulkObject(aof,&key) == 0) goto werr;
+#ifdef SUPPORT_PBA
+                if (rioWriteBulkObjectPBA(aof,o) == 0) goto werr;
+#else
                 if (rioWriteBulkObject(aof,o) == 0) goto werr;
+#endif
             } else if (o->type == OBJ_LIST) {
                 if (rewriteListObject(aof,&key,o) == 0) goto werr;
             } else if (o->type == OBJ_SET) {
@@ -1552,6 +2067,20 @@ void backgroundRewriteDoneHandler(int exitcode, int bysignal) {
         /* Change state from WAIT_REWRITE to ON if needed */
         if (server.aof_state == AOF_WAIT_REWRITE)
             server.aof_state = AOF_ON;
+
+#ifdef USE_AOFGUARD
+        if(server.aofguard.enable)
+        {
+            bioCreateBackgroundJob(BIO_DEINIT_AOFGUARD, (void*)server.aofguard.aofguard, NULL, NULL);
+            server.aofguard.aofguard = zmalloc(sizeof(struct aofguard));
+            if(!aofguard_init(server.aofguard.aofguard, server.aof_fd, server.aofguard.nvm_dir_fd,
+                server.aofguard.nvm_file_name, AOFGUARD_NVM_SIZE, 1))
+            {
+                serverLog(LL_WARNING, "aofguard_init() for '%s/%s' failed!", server.nvm_dir, server.aofguard.nvm_file_name);
+                exit(1);
+            }    
+        }
+#endif
 
         /* Asynchronously close the overwritten AOF. */
         if (oldfd != -1) bioCreateBackgroundJob(BIO_CLOSE_FILE,(void*)(long)oldfd,NULL,NULL);

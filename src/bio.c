@@ -199,7 +199,20 @@ void *bioProcessBackgroundJobs(void *arg) {
                 lazyfreeFreeDatabaseFromBioThread(job->arg2,job->arg3);
             else if (job->arg3)
                 lazyfreeFreeSlotsMapFromBioThread(job->arg3);
-        } else {
+        }
+#ifdef USE_AOFGUARD
+        else if(type == BIO_DEINIT_AOFGUARD)
+        {
+            struct aofguard* aofguard = job->arg1;
+            if(!aofguard_deinit(aofguard))
+            {
+                serverLog(LL_WARNING, "aofguard_deinit() failed!");
+                exit(1);
+            }
+            zfree(aofguard);
+        }
+#endif
+        else {
             serverPanic("Wrong job type in bioProcessBackgroundJobs().");
         }
         zfree(job);

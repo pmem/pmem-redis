@@ -1,4 +1,11 @@
-start_server {tags {"string"}} {
+start_server {
+    tags {"string"}
+    overrides {
+            "nvm-threshold" 10
+            "nvm-maxcapacity" 12
+            "nvm-dir" "/mnt/pmem4"
+        }
+} {
     test {SET and GET an item} {
         r set x foobar
         r get x
@@ -419,4 +426,350 @@ start_server {tags {"string"}} {
         r set foo bar
         r getrange foo 0 4294967297
     } {bar}
+
+    #nvm test case
+    test {NVM SET and GET an item} {
+            r set x foooooooobar
+            r get x
+        } {foooooooobar}
+
+        test {NVM Very big payload in GET/SET} {
+            set buf [string repeat "abcdefghijklmn" 1000000]
+            r set foo $buf
+            r get foo
+        } [string repeat "abcdefghijklmn" 1000000]
+
+        tags {NVM "slow"} {
+            test {Very big payload random access} {
+                set err {}
+                array set payload {}
+                for {set j 0} {$j < 100} {incr j} {
+                    set size [expr 1+[randomInt 100000]]
+                    set buf [string repeat "pl-$j" $size]
+                    set payload($j) $buf
+                    r set bigpayload_$j $buf
+                }
+                for {set j 0} {$j < 1000} {incr j} {
+                    set index [randomInt 100]
+                    set buf [r get bigpayload_$index]
+                    if {$buf != $payload($index)} {
+                        set err "Values differ: I set '$payload($index)' but I read back '$buf'"
+                        break
+                    }
+                }
+                unset payload
+                set _ $err
+            } {}
+
+            test {NVM SET 10000 numeric keys and access all them in reverse order} {
+                r flushdb
+                set err {}
+                for {set x 0} {$x < 10000} {incr x} {
+                    set y [expr {$x + 1000000000}]
+                    r set $x $y
+                }
+                set sum 0
+                for {set x 9999} {$x >= 0} {incr x -1} {
+                    set val [r get $x]
+                    set z [expr {$x + 1000000000}]
+                    if {$val ne $z} {
+                        set err "Element at position $x is $val instead of $z"
+                        break
+                    }
+                }
+                set _ $err
+            } {}
+
+            test {DBSIZE should be 10000 now} {
+                r dbsize
+            } {10000}
+        }
+
+        test "NVM SETNX target key missing" {
+            r del novar
+            assert_equal 1 [r setnx novar foooooooooobared]
+            assert_equal "foooooooooobared" [r get novar]
+        }
+
+        test "NVM SETNX target key exists" {
+            r set novar foooooooooobared
+            assert_equal 0 [r setnx novar blablablabla]
+            assert_equal "foooooooooobared" [r get novar]
+        }
+
+        test "NVM SETNX against not-expired volatile key" {
+            r set x 100000000000
+            r expire x 10000
+            assert_equal 0 [r setnx x 20]
+            assert_equal 100000000000 [r get x]
+        }
+
+        test "NVM SETNX against expired volatile key" {
+            # Make it very unlikely for the key this test uses to be expired by the
+            # active expiry cycle. This is tightly coupled to the implementation of
+            # active expiry and dbAdd() but currently the only way to test that
+            # SETNX expires a key when it should have been.
+            for {set x 0} {$x < 9999} {incr x} {
+                r setex key-$x 3600 value
+            }
+
+            # This will be one of 10000 expiring keys. A cycle is executed every
+            # 100ms, sampling 10 keys for being expired or not.  This key will be
+            # expired for at most 1s when we wait 2s, resulting in a total sample
+            # of 100 keys. The probability of the success of this test being a
+            # false positive is therefore approx. 1%.
+            r set x 10000000000
+            r expire x 1
+
+            # Wait for the key to expire
+            after 2000
+
+            assert_equal 1 [r setnx x 20000000000]
+            assert_equal 20000000000 [r get x]
+        }
+
+        test {NVM MGET} {
+            r flushdb
+            r set foo BARBARBARBAR
+            r set bar FOOFOOFOOFOO
+            r mget foo bar
+        } {BARBARBARBAR FOOFOOFOOFOO}
+
+        test {NVM MGET against non existing key} {
+            r mget foo baazz bar
+        } {BARBARBARBAR {} FOOFOOFOOFOO}
+
+        test {NVM MGET against non-string key} {
+            r sadd myset ciaoblabla
+            r sadd myset baublablabla
+            r mget foo baazz bar myset
+        } {BARBARBARBAR {} FOOFOOFOOFOO {}}
+
+        test {NVM GETSET (set new value)} {
+            r del foo
+            list [r getset foo xyzxyzxyzxyz] [r get foo]
+        } {{} xyzxyzxyzxyz}
+
+        test {NVM GETSET (replace old value)} {
+            r set foo barbarbarbar
+            list [r getset foo xyz] [r get foo]
+        } {barbarbarbar xyz}
+
+        test {NVM MSET base case} {
+            r mset x 10 y "foo bar" z "x x x x x x x\n\n\r\n"
+            r mget x y z
+        } [list 10 {foo bar} "x x x x x x x\n\n\r\n"]
+
+        test {NVM MSET wrong number of args} {
+            catch {r mset x 10 y "foo bar" z} err
+            format $err
+        } {*wrong number*}
+
+        test {NVM MSETNX with already existent key} {
+            list [r msetnx x1 xxxxxxxxxxx y2 yyyyyyyyyyyy x 20] [r exists x1] [r exists y2]
+        } {0 0 0}
+
+        test {NVM MSETNX with not existing keys} {
+            list [r msetnx x1 xxxxxxxxxxx y2 yyyyyyyyyyy] [r get x1] [r get y2]
+        } {1 xxxxxxxxxxx yyyyyyyyyyy}
+
+        test "NVM STRLEN against non-existing key" {
+            assert_equal 0 [r strlen notakey]
+        }
+
+        test "NVM STRLEN against integer-encoded value" {
+            r set myinteger -55555555555
+            assert_equal 12 [r strlen myinteger]
+        }
+
+        test "NVM STRLEN against plain string" {
+            r set mystring "foozzz0123456789 baz"
+            assert_equal 20 [r strlen mystring]
+        }
+
+        test "NVM SETRANGE against non-existing key" {
+            r del mykey
+            assert_equal 11 [r setrange mykey 0 foooooooooo]
+            assert_equal "foooooooooo" [r get mykey]
+
+            r del mykey
+            assert_equal 0 [r setrange mykey 0 ""]
+            assert_equal 0 [r exists mykey]
+
+            r del mykey
+            assert_equal 12 [r setrange mykey 1 foooooooooo]
+            assert_equal "\000foooooooooo" [r get mykey]
+        }
+
+        test "NVM SETRANGE against string-encoded key" {
+            r set mykey "foooooooooo"
+            assert_equal 11 [r setrange mykey 0 b]
+            assert_equal "boooooooooo" [r get mykey]
+
+            r set mykey "foooooooooo"
+            assert_equal 11 [r setrange mykey 0 ""]
+            assert_equal "foooooooooo" [r get mykey]
+
+            r set mykey "foooooooooo"
+            assert_equal 11 [r setrange mykey 1 b]
+            assert_equal "fbooooooooo" [r get mykey]
+
+            r set mykey "foooooooooo"
+            assert_equal 15 [r setrange mykey 12 bar]
+            assert_equal "foooooooooo\000bar" [r get mykey]
+        }
+
+        test "NVM SETRANGE against integer-encoded key" {
+            r set mykey 12345678910
+            assert_encoding int mykey
+            assert_equal 11 [r setrange mykey 0 2]
+            assert_encoding raw mykey
+            assert_equal 22345678910 [r get mykey]
+
+            # Shouldn't change encoding when nothing is set
+            r set mykey 12345678910
+            assert_encoding int mykey
+            assert_equal 11 [r setrange mykey 0 ""]
+            assert_encoding int mykey
+            assert_equal 12345678910 [r get mykey]
+
+            r set mykey 12345678910
+            assert_encoding int mykey
+            assert_equal 11 [r setrange mykey 1 3]
+            assert_encoding raw mykey
+            assert_equal 13345678910 [r get mykey]
+
+            r set mykey 12345678910
+            assert_encoding int mykey
+            assert_equal 13 [r setrange mykey 12 2]
+            assert_encoding raw mykey
+            assert_equal "12345678910\0002" [r get mykey]
+        }
+
+        test "NVM SETRANGE against key with wrong type" {
+            r del mykey
+            r lpush mykey "foo"
+            assert_error "WRONGTYPE*" {r setrange mykey 0 bar}
+        }
+
+        test "SETRANGE with out of range offset" {
+            r del mykey
+            assert_error "*maximum allowed size*" {r setrange mykey [expr 512*1024*1024-4] world}
+
+            r set mykey "hello"
+            assert_error "*out of range*" {r setrange mykey -1 world}
+            assert_error "*maximum allowed size*" {r setrange mykey [expr 512*1024*1024-4] world}
+        }
+
+        test "GETRANGE against non-existing key" {
+            r del mykey
+            assert_equal "" [r getrange mykey 0 -1]
+        }
+
+        test "NVM GETRANGE against string value" {
+            r set mykey "Hello World"
+            assert_equal "Hell" [r getrange mykey 0 3]
+            assert_equal "Hello World" [r getrange mykey 0 -1]
+            assert_equal "orld" [r getrange mykey -4 -1]
+            assert_equal "" [r getrange mykey 5 3]
+            assert_equal " World" [r getrange mykey 5 5000]
+            assert_equal "Hello World" [r getrange mykey -5000 10000]
+        }
+
+        test "NVM GETRANGE against integer-encoded value" {
+            r set mykey 12345678910
+            assert_equal "123" [r getrange mykey 0 2]
+            assert_equal "12345678910" [r getrange mykey 0 -1]
+            assert_equal "910" [r getrange mykey -3 -1]
+            assert_equal "" [r getrange mykey 5 3]
+            assert_equal "45678910" [r getrange mykey 3 5000]
+            assert_equal "12345678910" [r getrange mykey -5000 10000]
+        }
+
+        test "NVM GETRANGE fuzzing" {
+            for {set i 0} {$i < 1000} {incr i} {
+                r set bin [set bin [randstring 0 1024 binary]]
+                set _start [set start [randomInt 1500]]
+                set _end [set end [randomInt 1500]]
+                if {$_start < 0} {set _start "end-[abs($_start)-1]"}
+                if {$_end < 0} {set _end "end-[abs($_end)-1]"}
+                assert_equal [string range $bin $_start $_end] [r getrange bin $start $end]
+            }
+        }
+
+        test {NVM Extended SET can detect syntax errors} {
+            set e {}
+            catch {r set foo bar non-existing-option} e
+            set e
+        } {*syntax*}
+
+        test {NVM Extended SET NX option} {
+            r del foo
+            set v1 [r set foo 12345678910 nx]
+            set v2 [r set foo 22345678910 nx]
+            list $v1 $v2 [r get foo]
+        } {OK {} 12345678910}
+
+        test {NVM Extended SET XX option} {
+            r del foo
+            set v1 [r set foo 12345678910 xx]
+            r set foo bar
+            set v2 [r set foo 22345678910 xx]
+            list $v1 $v2 [r get foo]
+        } {{} OK 22345678910}
+
+        test {NVM Extended SET EX option} {
+            r del foo
+            r set foo barbarbarbar ex 10
+            set ttl [r ttl foo]
+            assert {$ttl <= 10 && $ttl > 5}
+        }
+
+        test {NVM Extended SET PX option} {
+            r del foo
+            r set foo barbarbarbar px 10000
+            set ttl [r ttl foo]
+            assert {$ttl <= 10 && $ttl > 5}
+        }
+
+        test {NVM Extended SET using multiple options at once} {
+            r set foo valvalvalval
+            assert {[r set foo barbarbarbar xx px 10000] eq {OK}}
+            set ttl [r ttl foo]
+            assert {$ttl <= 10 && $ttl > 5}
+        }
+
+        test {NVM GETRANGE with huge ranges, Github issue #1844} {
+            r set foo barbarbarbar
+            r getrange foo 0 4294967297
+        } {barbarbarbar}
+
+        test {[NVM] bgsave NVM COW} {
+         waitForBgsave r
+         r flushdb
+
+         for {set i 0} {$i < 1000} {incr i} {
+            set set_key nvm_set_$i
+            r set nvm_set_$i xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx_$i            
+         }
+
+         set f [r info Memory]
+         regexp {used_nvm:(.*?)\r\n} $f - used_nvm
+         assert {$used_nvm>0}
+
+         r bgsave
+
+         for {set i 0} {$i < 200000} {incr i} {
+            set set_key nvm_set_$i
+            r set nvm_set_$i xxxxxxxxxxxxxxxxxxxxxxxxyyyyyyyyyyyyyyyyyxxxxxxxxxxxxxxxxxxxxxxx_$i
+         }
+
+         waitForBgsave r
+
+         set i [r info persistence]
+         regexp {rdb_last_nvm_cow_size:(.*?)\r\n} $i - cowsize
+         assert {$cowsize>0}
+        }
+
+
 }

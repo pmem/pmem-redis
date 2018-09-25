@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2018, Intel Corporation
  * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
  * All rights reserved.
  *
@@ -29,6 +30,10 @@
 
 #include "server.h"
 #include <math.h> /* isnan(), isinf() */
+
+#ifdef USE_NVM
+#include "nvm.h"
+#endif
 
 /*-----------------------------------------------------------------------------
  * String Commands
@@ -66,6 +71,7 @@ static int checkStringLength(client *c, long long size) {
 
 void setGenericCommand(client *c, int flags, robj *key, robj *val, robj *expire, int unit, robj *ok_reply, robj *abort_reply) {
     long long milliseconds = 0; /* initialized to avoid any harmness warning */
+    robj * oldval;
 
     if (expire) {
         if (getLongLongFromObjectOrReply(c, expire, &milliseconds, NULL) != C_OK)
@@ -76,13 +82,24 @@ void setGenericCommand(client *c, int flags, robj *key, robj *val, robj *expire,
         }
         if (unit == UNIT_SECONDS) milliseconds *= 1000;
     }
-
-    if ((flags & OBJ_SET_NX && lookupKeyWrite(c->db,key) != NULL) ||
-        (flags & OBJ_SET_XX && lookupKeyWrite(c->db,key) == NULL))
+    
+    oldval=lookupKeyWrite(c->db,key);
+    if ((flags & OBJ_SET_NX && oldval != NULL) ||
+        (flags & OBJ_SET_XX && oldval == NULL))
     {
         addReply(c, abort_reply ? abort_reply : shared.nullbulk);
         return;
     }
+
+#ifdef USE_NVM
+    if(val->encoding == OBJ_ENCODING_RAW) {
+        val->ptr = sdsmvtonvm(val->ptr);
+        size_t header_size = sdsheadersize(val->ptr);
+        size_t total_size = header_size + sdsalloc(val->ptr) + 1;
+        if(total_size >= server.sdsmv_threshold && !is_nvm_addr(val->ptr))
+            val->need_mv_to_nvm = 1;
+    }
+#endif
     setKey(c->db,key,val);
     server.dirty++;
     if (expire) setExpire(c,c->db,key,mstime()+milliseconds);
@@ -176,6 +193,16 @@ void getCommand(client *c) {
 void getsetCommand(client *c) {
     if (getGenericCommand(c) == C_ERR) return;
     c->argv[2] = tryObjectEncoding(c->argv[2]);
+#ifdef USE_NVM
+    robj* val = c->argv[2];
+    if(val->encoding == OBJ_ENCODING_RAW) {
+        val->ptr = sdsmvtonvm(val->ptr);
+        size_t header_size = sdsheadersize(val->ptr);
+        size_t total_size = header_size + sdsalloc(val->ptr) + 1;
+        if(total_size >= server.sdsmv_threshold && !is_nvm_addr(val->ptr))
+            val->need_mv_to_nvm = 1;
+    }
+#endif
     setKey(c->db,c->argv[1],c->argv[2]);
     notifyKeyspaceEvent(NOTIFY_STRING,"set",c->argv[1],c->db->id);
     server.dirty++;
@@ -231,8 +258,26 @@ void setrangeCommand(client *c) {
     }
 
     if (sdslen(value) > 0) {
+#ifdef SUPPORT_PBA
+        int is_pba = IS_PBA();
+        if(is_pba && o->encoding == OBJ_ENCODING_RAW && is_nvm_addr(o->ptr))
+            o->ptr = sdsmvtodram(o->ptr);
+#endif
         o->ptr = sdsgrowzero(o->ptr,offset+sdslen(value));
         memcpy((char*)o->ptr+offset,value,sdslen(value));
+#ifdef USE_NVM
+        if(o->encoding == OBJ_ENCODING_RAW && !is_nvm_addr(o->ptr)) {
+            o->ptr = sdsmvtonvm(o->ptr);
+        }
+#endif
+#ifdef SUPPORT_PBA
+        if(is_pba && o->encoding == OBJ_ENCODING_RAW && is_nvm_addr(o->ptr))
+        {
+            robj* set = createStringObject("SET", 3);
+            rewriteClientCommandVector(c, 3, set, c->argv[1], o);
+            decrRefCount(set);
+        }
+#endif
         signalModifiedKey(c->db,c->argv[1]);
         notifyKeyspaceEvent(NOTIFY_STRING,
             "setrange",c->argv[1],c->db->id);
@@ -323,6 +368,16 @@ void msetGenericCommand(client *c, int nx) {
 
     for (j = 1; j < c->argc; j += 2) {
         c->argv[j+1] = tryObjectEncoding(c->argv[j+1]);
+#ifdef USE_NVM
+        robj* val = c->argv[j+1];
+        if(val->encoding == OBJ_ENCODING_RAW) {
+            val->ptr = sdsmvtonvm(val->ptr);
+            size_t header_size = sdsheadersize(val->ptr);
+            size_t total_size = header_size + sdsalloc(val->ptr) + 1;
+            if(total_size >= server.sdsmv_threshold && !is_nvm_addr(val->ptr))
+                val->need_mv_to_nvm = 1;
+        }
+#endif
         setKey(c->db,c->argv[j],c->argv[j+1]);
         notifyKeyspaceEvent(NOTIFY_STRING,"set",c->argv[j],c->db->id);
     }
@@ -440,6 +495,14 @@ void appendCommand(client *c) {
     if (o == NULL) {
         /* Create the key */
         c->argv[2] = tryObjectEncoding(c->argv[2]);
+#ifdef USE_NVM
+        robj* val = c->argv[2];
+        if(val->encoding == OBJ_ENCODING_RAW) {
+            val->ptr = sdsmvtonvm(val->ptr);
+            decrRefCount(c->argv[0]);
+            c->argv[0] = createStringObject("SET", 3);
+        }
+#endif
         dbAdd(c->db,c->argv[1],c->argv[2]);
         incrRefCount(c->argv[2]);
         totlen = stringObjectLen(c->argv[2]);
@@ -448,7 +511,10 @@ void appendCommand(client *c) {
         if (checkType(c,o,OBJ_STRING))
             return;
 
-        /* "append" is an argument, so always an sds */
+#ifdef AEP_COW 
+        o->ptr=redisduplicatenvmaddr(o->ptr);
+#endif
+        /* append is an argument, so always an sds */
         append = c->argv[2];
         totlen = stringObjectLen(o)+sdslen(append->ptr);
         if (checkStringLength(c,totlen) != C_OK)
@@ -456,8 +522,26 @@ void appendCommand(client *c) {
 
         /* Append the value */
         o = dbUnshareStringValue(c->db,c->argv[1],o);
+#ifdef SUPPORT_PBA
+        int is_pba = IS_PBA();
+        if(is_pba && o->encoding == OBJ_ENCODING_RAW && is_nvm_addr(o->ptr))
+            o->ptr = sdsmvtodram(o->ptr);
+#endif
         o->ptr = sdscatlen(o->ptr,append->ptr,sdslen(append->ptr));
         totlen = sdslen(o->ptr);
+#ifdef USE_NVM
+        if(o->encoding == OBJ_ENCODING_RAW && !is_nvm_addr(o->ptr)) {
+            o->ptr = sdsmvtonvm(o->ptr);
+        }
+#endif
+#ifdef SUPPORT_PBA
+        if(is_pba && o->encoding == OBJ_ENCODING_RAW && is_nvm_addr(o->ptr))
+        {
+            robj* set = createStringObject("SET", 3);
+            rewriteClientCommandVector(c, 3, set, c->argv[1], o);
+            decrRefCount(set);
+        }
+#endif
     }
     signalModifiedKey(c->db,c->argv[1]);
     notifyKeyspaceEvent(NOTIFY_STRING,"append",c->argv[1],c->db->id);

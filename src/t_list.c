@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2018, Intel Corporation
  * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
  * All rights reserved.
  *
@@ -28,11 +29,13 @@
  */
 
 #include "server.h"
+#ifdef USE_NVM
+#include "nvm.h"
+#endif
 
 /*-----------------------------------------------------------------------------
  * List API
  *----------------------------------------------------------------------------*/
-
 /* The function pushes an element to the specified list object 'subject',
  * at head or tail position as specified by 'where'.
  *
@@ -43,7 +46,21 @@ void listTypePush(robj *subject, robj *value, int where) {
         int pos = (where == LIST_HEAD) ? QUICKLIST_HEAD : QUICKLIST_TAIL;
         value = getDecodedObject(value);
         size_t len = sdslen(value->ptr);
-        quicklistPush(subject->ptr, value->ptr, len, pos);
+        sds ele = value->ptr;
+#ifdef USE_NVM
+        if(server.nvm_base && len > server.sdsmv_threshold)
+        {
+            sds e = sdsdupnvm(ele);
+            if(!is_nvm_addr(e))
+                sdsfree(e);
+            else
+                ele = e;
+        }
+#endif
+#ifdef SUPPORT_PBA
+        setArgPBA(ele);
+#endif
+        quicklistPush(subject->ptr, ele, len, pos);
         decrRefCount(value);
     } else {
         serverPanic("Unknown list encoding");
@@ -143,6 +160,19 @@ void listTypeInsert(listTypeEntry *entry, robj *value, int where) {
         value = getDecodedObject(value);
         sds str = value->ptr;
         size_t len = sdslen(str);
+#ifdef USE_NVM
+        if(server.nvm_base && len > server.sdsmv_threshold)
+        {
+            sds e = sdsdupnvm(str);
+            if(!is_nvm_addr(e))
+                sdsfree(e);
+            else
+                str = e;
+        }
+#endif
+#ifdef SUPPORT_PBA
+        setArgPBA(str);
+#endif
         if (where == LIST_TAIL) {
             quicklistInsertAfter((quicklist *)entry->entry.quicklist,
                                  &entry->entry, str, len);
@@ -193,7 +223,6 @@ void listTypeConvert(robj *subject, int enc) {
 /*-----------------------------------------------------------------------------
  * List Commands
  *----------------------------------------------------------------------------*/
-
 void pushGenericCommand(client *c, int where) {
     int j, pushed = 0;
     robj *lobj = lookupKeyWrite(c->db,c->argv[1]);
@@ -210,6 +239,9 @@ void pushGenericCommand(client *c, int where) {
                                 server.list_compress_depth);
             dbAdd(c->db,c->argv[1],lobj);
         }
+#ifdef SUPPORT_PBA
+        server.pba.arg = c->argv[j];
+#endif
         listTypePush(lobj,c->argv[j],where);
         pushed++;
     }
@@ -239,6 +271,9 @@ void pushxGenericCommand(client *c, int where) {
         checkType(c,subject,OBJ_LIST)) return;
 
     for (j = 2; j < c->argc; j++) {
+#ifdef SUPPORT_PBA
+        server.pba.arg = c->argv[j];
+#endif
         listTypePush(subject,c->argv[j],where);
         pushed++;
     }
@@ -284,6 +319,15 @@ void linsertCommand(client *c) {
     iter = listTypeInitIterator(subject,0,LIST_TAIL);
     while (listTypeNext(iter,&entry)) {
         if (listTypeEqual(&entry,c->argv[3])) {
+#ifdef SUPPORT_PBA
+            unsigned char* base = entry.entry.value;
+            if(is_nvm_addr(base) && !IS_EMBED_IN_ZIPLIST(base, entry.entry.node->zl))
+            {
+                server.pba.arg = c->argv[3];
+                setArgPBA((sds)base);
+            }
+            server.pba.arg = c->argv[4];
+#endif
             listTypeInsert(&entry,c->argv[4],where);
             inserted = 1;
             break;
@@ -348,9 +392,28 @@ void lsetCommand(client *c) {
         return;
 
     if (o->encoding == OBJ_ENCODING_QUICKLIST) {
-        quicklist *ql = o->ptr;
+        quicklist *ql = o->ptr;  
+#ifdef USE_NVM
+        sds str = value->ptr;
+        size_t len = sdslen(str);
+        if(server.nvm_base && len > server.sdsmv_threshold)
+        {
+            sds e = sdsdupnvm(str);
+            if(!is_nvm_addr(e))
+                sdsfree(e);
+            else
+                str = e;
+        }
+        int replaced = quicklistReplaceAtIndex(ql, index, str, len);
+        if(!replaced && is_nvm_addr(str))
+            sdsfree(str);
+#else
         int replaced = quicklistReplaceAtIndex(ql, index,
                                                value->ptr, sdslen(value->ptr));
+#endif
+#ifdef SUPPORT_PBA
+        setArgPBA(str);
+#endif
         if (!replaced) {
             addReply(c,shared.outofrangeerr);
         } else {
@@ -507,16 +570,52 @@ void lremCommand(client *c) {
         li = listTypeInitIterator(subject,0,LIST_TAIL);
     }
 
+#ifdef SUPPORT_PBA
+    int is_pba = IS_PBA();
+    robj* propargv[3];
+    if(is_pba)
+    {
+        propargv[0] = createStringObject("LDEL", 4);
+        propargv[1] = c->argv[1];
+    }
+    long len = listTypeLength(subject);
+    long index = li->direction == LIST_TAIL ? 0 : len - 1;
+#endif
+
     listTypeEntry entry;
     while (listTypeNext(li,&entry)) {
         if (listTypeEqual(&entry,obj)) {
+#ifdef SUPPORT_PBA
+            if(is_pba)
+            {
+                propargv[2] = createStringObjectFromLongLong(index);
+                alsoPropagate(server.pba.ldelCommand, c->db->id, propargv, 3, PROPAGATE_AOF);
+                decrRefCount(propargv[2]);
+            }
+            if(li->direction == LIST_HEAD)
+                index--;
+#endif
             listTypeDelete(li, &entry);
             server.dirty++;
             removed++;
             if (toremove && removed == toremove) break;
         }
+#ifdef SUPPORT_PBA
+        else if(li->direction == LIST_TAIL)
+            index++;
+        else
+            index--;
+#endif
     }
     listTypeReleaseIterator(li);
+
+#ifdef SUPPORT_PBA
+    if(is_pba)
+    {
+        decrRefCount(propargv[0]);
+        preventCommandAOF(c);
+    }
+#endif
 
     if (removed) {
         signalModifiedKey(c->db,c->argv[1]);
@@ -530,6 +629,37 @@ void lremCommand(client *c) {
 
     addReplyLongLong(c,removed);
 }
+
+#ifdef SUPPORT_PBA
+void ldelCommand(client *c)
+{
+    long index;
+    if(getLongFromObjectOrReply(c, c->argv[2], &index, NULL) != C_OK)
+        return;
+    robj* o = lookupKeyWriteOrReply(c, c->argv[1], shared.nokeyerr);
+    if(!o || checkType(c, o, OBJ_LIST))
+        return;
+    long len = listTypeLength(o);
+    if(index < 0 || index >= len)
+    {
+        addReply(c, shared.outofrangeerr);
+        return;
+    }
+    if(o->encoding == OBJ_ENCODING_QUICKLIST)
+        quicklistDelRange(o->ptr, index , 1);
+    else
+        serverPanic("Unknown list encoding");
+    notifyKeyspaceEvent(NOTIFY_LIST, "ldel", c->argv[1], c->db->id);
+    if(listTypeLength(o) == 0)
+    {
+        dbDelete(c->db, c->argv[1]);
+        notifyKeyspaceEvent(NOTIFY_GENERIC, "del", c->argv[1], c->db->id);
+    }
+    signalModifiedKey(c->db, c->argv[1]);
+    server.dirty++;
+    addReply(c,shared.ok);
+}
+#endif
 
 /* This is the semantic of this command:
  *  RPOPLPUSH srclist dstlist:
@@ -566,7 +696,7 @@ void rpoplpushCommand(client *c) {
     robj *sobj, *value;
     if ((sobj = lookupKeyWriteOrReply(c,c->argv[1],shared.nullbulk)) == NULL ||
         checkType(c,sobj,OBJ_LIST)) return;
-
+    
     if (listTypeLength(sobj) == 0) {
         /* This may only happen after loading very old RDB files. Recent
          * versions of Redis delete keys of empty lists. */
@@ -576,6 +706,7 @@ void rpoplpushCommand(client *c) {
         robj *touchedkey = c->argv[1];
 
         if (dobj && checkType(c,dobj,OBJ_LIST)) return;
+
         value = listTypePop(sobj,LIST_TAIL);
         /* We saved touched key, and protect it, since rpoplpushHandlePush
          * may change the client command argument vector (it does not
@@ -599,6 +730,8 @@ void rpoplpushCommand(client *c) {
     }
 }
 
+
+/*Dennis: TBD*/
 /*-----------------------------------------------------------------------------
  * Blocking POP operations
  *----------------------------------------------------------------------------*/

@@ -1,5 +1,119 @@
-start_server {tags {"hash"}} {
-    test {HSET/HLEN - Small hash creation} {
+start_server {
+   tags {"hash"}
+   overrides {
+        "nvm-maxcapacity" 10
+        "nvm-dir" "/mnt/pmem4/"
+        "nvm-threshold" 64
+        "list-max-ziplist-size" 5
+        "maxmemory" 1073741824
+        "maxmemory-policy" "allkeys-lru"
+    }
+
+} {
+    
+    test {[NVM] bgsave NVM COW} {
+        waitForBgsave r
+        r flushdb
+
+        array set nvmhash_save {}
+        for {set i 0} {$i < 1000} {incr i} {
+            for {set j 0} {$j < 4} {incr j} {
+              r hset nvmhash_save_$i field_$j  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx_$i
+           }
+        }
+
+
+        set f [r info Memory]
+        regexp {used_nvm:(.*?)\r\n} $f - used_nvm
+        assert {$used_nvm>0}
+
+        r bgsave
+
+        array set nvmhash_save {}
+        for {set i 0} {$i < 200} {incr i} {
+            for {set j 0} {$j < 4} {incr j} {
+              r hset nvmhash_save_$i field_$j  yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyxxxxxxxxxxxxx_$i
+           }
+        }
+
+
+        waitForBgsave r
+
+        set i [r info persistence]
+        regexp {rdb_last_nvm_cow_size:(.*?)\r\n} $i - cowsize
+        assert {$cowsize>0}
+    }
+   
+
+
+    test {[NVM] HSET/HLEN - Big hash creation} {
+        array set nvmhash {}
+        for {set i 0} {$i < 1024} {incr i} {
+            set key __avoid_collisions__[randstring 0 8 alpha]
+            set val __avoid_collisions__[randstring 0 128 alpha]
+            if {[info exists nvmhash($key)]} {
+                incr i -1
+                continue
+            }
+            r hset nvmhash $key $val
+            set nvmhash($key) $val
+        }
+        list [r hlen nvmhash]
+    } {1024}
+
+    test {[NVM] Is the big hash encoded with a hashtable with NVM?} {
+        assert_encoding hashtable nvmhash
+    } 
+
+    test {[NVM] Is data in NVM?} { 
+        set i [r info Memory]
+        regexp {used_nvm:(.*?)\r\n} $i - used_nvm
+        assert {$used_nvm>0}   
+    }
+
+    test {[NVM] HGET- NVM against the NVM  hash} {
+        set err {}
+        foreach k [array names nvmhash *] {
+            if {$nvmhash($k) ne [r hget nvmhash $k]} {
+                set err "$nvmhash($k) != [r hget nvmhash $k]"
+                break
+            }
+        }
+        set _ $err
+    } {}
+    
+    test {[NVM] HMSET - NVM big hash NVM} {
+        set args {}
+        foreach {k v} [array get nvmhash] {
+            set newval [randstring 0 128 alpha]
+            set nvmhash($k) $newval
+            lappend args $k $newval
+        }
+        r hmset nvmhash {*}$args
+    } {OK}
+
+   test {[NVM] HMGET against non existing key and fields} {
+        set rv {}
+        lappend rv [r hmget doesntexist __123123123123123123123123123123123123123123123__ __456456456456456456456456456456456__]
+        lappend rv [r hmget nvmhash __123123123123123123123123123123123123123123123__ __456456456456456456456456456456456__]
+        set _ $rv
+    } {{{} {}} {{} {}}}
+
+   test {[NVM] HDEL - more than a single value} {
+        set rv {}
+        r del myhash
+        r hmset myhash a a_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx b b_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx c c_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+        assert_equal 0 [r hdel myhash x y]
+        assert_equal 2 [r hdel myhash a c f]
+        r hgetall myhash
+    } {b b_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx}
+
+    test {[NVM] HINCRBY against non existing database key} {
+        r del htest
+        list [r hincrby htest foo_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx 2]
+    } {2}
+
+   test {HSET/HLEN - Small hash creation} {
         array set smallhash {}
         for {set i 0} {$i < 8} {incr i} {
             set key __avoid_collisions__[randstring 0 8 alpha]

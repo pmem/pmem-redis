@@ -30,6 +30,7 @@
 
 #include "server.h"
 #include <sys/stat.h>
+#include "zmalloc.h"
 
 #define ERROR(...) { \
     char __buf[1024]; \

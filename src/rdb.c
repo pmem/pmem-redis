@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2018, Intel Corporation
  * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
  * All rights reserved.
  *
@@ -40,6 +41,10 @@
 #include <arpa/inet.h>
 #include <sys/stat.h>
 #include <sys/param.h>
+#ifdef AEP_COW
+#include "bio.h"
+#include "nvm.h"
+#endif
 
 #define rdbExitReportCorruptRDB(...) rdbCheckThenExit(__LINE__,__VA_ARGS__)
 
@@ -338,14 +343,26 @@ void *rdbLoadLzfStringObject(rio *rdb, int flags, size_t *lenptr) {
 
     if ((clen = rdbLoadLen(rdb,NULL)) == RDB_LENERR) return NULL;
     if ((len = rdbLoadLen(rdb,NULL)) == RDB_LENERR) return NULL;
+#ifdef USE_NVM
+    if ((c = s_zmalloc(clen)) == NULL) goto err;
+#else
     if ((c = zmalloc(clen)) == NULL) goto err;
+#endif
 
     /* Allocate our target according to the uncompressed size. */
     if (plain) {
+#ifdef USE_NVM
+        val = s_zmalloc(len);
+#else
         val = zmalloc(len);
+#endif
         if (lenptr) *lenptr = len;
     } else {
+#ifdef USE_NVM
+        val = sdsnewlennvm(NULL,len);
+#else
         val = sdsnewlen(NULL,len);
+#endif
     }
 
     /* Load the compressed representation and uncompress it to target. */
@@ -471,7 +488,11 @@ void *rdbGenericLoadStringObject(rio *rdb, int flags, size_t *lenptr) {
 
     if (len == RDB_LENERR) return NULL;
     if (plain || sds) {
+#ifdef USE_NVM
+        void *buf = plain ? s_zmalloc(len) : sdsnewlennvm(NULL,len);
+#else
         void *buf = plain ? zmalloc(len) : sdsnewlen(NULL,len);
+#endif
         if (lenptr) *lenptr = len;
         if (len && rioRead(rdb,buf,len) == 0) {
             if (plain)
@@ -663,8 +684,21 @@ ssize_t rdbSaveObject(rio *rdb, robj *o) {
                     if ((n = rdbSaveLzfBlob(rdb,data,compress_len,node->sz)) == -1) return -1;
                     nwritten += n;
                 } else {
+#ifdef USE_NVM
+                    unsigned char* old_zl = node->zl;
+                    node->zl = ziplistNVMEntryDecode(node->zl);
+                    unsigned int old_sz = node->sz;
+                    node->sz = ziplistBlobLen((unsigned char*)node->zl);
+#endif
+
                     if ((n = rdbSaveRawString(rdb,node->zl,node->sz)) == -1) return -1;
                     nwritten += n;
+
+#ifdef USE_NVM
+                    zfree(node->zl);
+                    node->zl = old_zl;
+                    node->sz = old_sz;
+#endif
                 }
             } while ((node = node->next));
         } else {
@@ -698,16 +732,27 @@ ssize_t rdbSaveObject(rio *rdb, robj *o) {
     } else if (o->type == OBJ_ZSET) {
         /* Save a sorted set value */
         if (o->encoding == OBJ_ENCODING_ZIPLIST) {
+#ifdef USE_NVM
+            unsigned char* old_ptr = o->ptr;
+            o->ptr = ziplistNVMEntryDecode(o->ptr);
+#endif
             size_t l = ziplistBlobLen((unsigned char*)o->ptr);
 
             if ((n = rdbSaveRawString(rdb,o->ptr,l)) == -1) return -1;
             nwritten += n;
+
+#ifdef USE_NVM
+            zfree(o->ptr);
+            o->ptr = old_ptr;
+#endif
+
         } else if (o->encoding == OBJ_ENCODING_SKIPLIST) {
             zset *zs = o->ptr;
             zskiplist *zsl = zs->zsl;
 
             if ((n = rdbSaveLen(rdb,zsl->length)) == -1) return -1;
             nwritten += n;
+
 
             /* We save the skiplist elements from the greatest to the smallest
              * (that's trivial since the elements are already ordered in the
@@ -734,10 +779,20 @@ ssize_t rdbSaveObject(rio *rdb, robj *o) {
     } else if (o->type == OBJ_HASH) {
         /* Save a hash value */
         if (o->encoding == OBJ_ENCODING_ZIPLIST) {
+#ifdef USE_NVM
+            unsigned char* old_ptr = o->ptr;
+            o->ptr = ziplistNVMEntryDecode(o->ptr);
+#endif
+
             size_t l = ziplistBlobLen((unsigned char*)o->ptr);
 
             if ((n = rdbSaveRawString(rdb,o->ptr,l)) == -1) return -1;
             nwritten += n;
+
+#ifdef USE_NVM
+            zfree(o->ptr);
+            o->ptr = old_ptr;
+#endif
 
         } else if (o->encoding == OBJ_ENCODING_HT) {
             dictIterator *di = dictGetIterator(o->ptr);
@@ -871,6 +926,10 @@ int rdbSaveInfoAuxFields(rio *rdb, int flags, rdbSaveInfo *rsi) {
     return 1;
 }
 
+/*
+#include "time.h"
+#include <unistd.h>
+*/
 /* Produces a dump of the database in RDB format sending it to the specified
  * Redis I/O channel. On success C_OK is returned, otherwise C_ERR
  * is returned and part of the output, or all the output, can be
@@ -939,6 +998,7 @@ int rdbSaveRio(rio *rdb, int *error, int flags, rdbSaveInfo *rsi) {
                 processed = rdb->processed_bytes;
                 aofReadDiffFromParent();
             }
+            /*sleep(10);*/
         }
         dictReleaseIterator(di);
     }
@@ -1699,6 +1759,16 @@ void backgroundSaveDoneHandlerDisk(int exitcode, int bysignal) {
     /* Possibly there are slaves waiting for a BGSAVE in order to be served
      * (the first stage of SYNC is a bulk transfer of dump.rdb) */
     updateSlavesWaitingBgsave((!bysignal && exitcode == 0) ? C_OK : C_ERR, RDB_CHILD_TYPE_DISK);
+#ifdef AEP_COW
+    serverLog(LL_NOTICE, "RDB BGSAVE duplicate nvm_size=%ld, memorysize=%ld",server.cow_nvm_size,server.cow_mem_size);
+    serverLog(LL_NOTICE, "RDB BGSAVE before lazy release, memory_used=%ld, nvm_used=%ld",zmalloc_used_memory(),nvm_get_used());
+    bioCreateBackgroundJob(BIO_LAZY_FREE,NULL,server.forked_dict,server.cow_dict); 
+    server.forked_dict=cow_createforknvmdict();
+    server.cow_dict = cow_createcownvmdict();
+    server.last_nvm_cow_size=server.cow_nvm_size + server.cow_mem_size;
+    server.cow_nvm_size=0;
+    server.cow_mem_size=0;
+#endif
 }
 
 /* A background saving child (BGSAVE) terminated its work. Handle this.

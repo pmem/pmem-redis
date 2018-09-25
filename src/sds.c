@@ -1,5 +1,6 @@
 /* SDSLib 2.0 -- A C dynamic strings library
  *
+ * Copyright (c) 2018, Intel Corporation
  * Copyright (c) 2006-2015, Salvatore Sanfilippo <antirez at gmail dot com>
  * Copyright (c) 2015, Oran Agra
  * Copyright (c) 2015, Redis Labs, Inc
@@ -30,6 +31,14 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+#ifdef USE_NVM
+    /*#ifdef _DEFAULT_SOURCE
+    #undef _DEFAULT_SOURCE
+    #endif*/
+#include "server.h"
+#include "libpmem.h"
+#include "nvm.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,6 +47,7 @@
 #include <limits.h>
 #include "sds.h"
 #include "sdsalloc.h"
+
 
 static inline int sdsHdrSize(char type) {
     switch(type&SDS_TYPE_MASK) {
@@ -68,6 +78,138 @@ static inline char sdsReqType(size_t string_size) {
 #endif
     return SDS_TYPE_64;
 }
+
+/*dennis update the function for the flush*/
+void s_memcpy(sds dest, const char * src, size_t len)
+{
+    memcpy(dest,src,len);
+
+#ifdef USE_NVM
+    size_t hdrsize=sdsHdrSize(dest[-1]);
+    void *ptr= dest-hdrsize;
+    if(is_nvm_addr(ptr))
+    {
+        pmem_flush(dest, len+hdrsize);
+        /*pmem_persist(dest, len+hdrsize);*/
+    }
+#endif
+}
+
+
+#ifdef USE_NVM
+
+size_t sdsheadersize(const sds s)
+{
+    return sdsHdrSize(s[-1]);
+}
+
+sds sdsmvtonvm(const sds s)
+{
+    if(server.nvm_base && !is_nvm_addr(s))
+    {
+        size_t header_size = sdsheadersize(s);
+        size_t total_size = header_size + sdsalloc(s) + 1;
+        if(total_size >= server.sdsmv_threshold)
+        {
+            void* new_sh = nvm_malloc(total_size);
+            if(!new_sh)
+            {
+                //serverLog(LL_WARNING, "Can't allocate on NVM. Keep data in memory.");
+                return s;
+            }
+            void* sh = s - header_size;
+            size_t used_size = header_size + sdslen(s) + 1;
+            pmem_memcpy_persist(new_sh, sh, used_size);
+            zfree(sh);
+            return (char*)new_sh + header_size;
+        }
+    }
+    return s;
+}
+
+sds sdsmvtodram(const sds s)
+{
+    if(is_nvm_addr(s))
+    {
+        size_t header_size = sdsheadersize(s);
+        size_t total_size = header_size + sdsalloc(s) + 1;
+        void* new_sh = zmalloc(total_size);
+        if(!new_sh)
+        {
+            serverLog(LL_WARNING, "Can't allocate on DRAM. Exiting...");
+            exit(1);
+        }
+        void* sh = s - header_size;
+        size_t used_size = header_size + sdslen(s) + 1;
+        memcpy(new_sh, sh, used_size);
+        zfree(sh);
+        return (char*)new_sh + header_size;
+    }
+    return s;
+}
+
+sds sdsnewlennvm(const void *init, size_t initlen) {
+    void *sh;
+    sds s;
+    char type = sdsReqType(initlen);
+    /* Empty strings are usually created in order to append. Use type 8
+     * since type 5 is not good at this. */
+    if (type == SDS_TYPE_5 && initlen == 0) type = SDS_TYPE_8;
+    int hdrlen = sdsHdrSize(type);
+    unsigned char *fp; /* flags pointer. */
+
+    sh = s_malloc_nvm(hdrlen+initlen+1);
+    if (sh == NULL) return NULL;
+    if (!init)
+        memset(sh, 0, hdrlen+initlen+1);
+    s = (char*)sh+hdrlen;
+    fp = ((unsigned char*)s)-1;
+    switch(type) {
+        case SDS_TYPE_5: {
+            *fp = type | (initlen << SDS_TYPE_BITS);
+            break;
+        }
+        case SDS_TYPE_8: {
+            SDS_HDR_VAR(8,s);
+            sh->len = initlen;
+            sh->alloc = initlen;
+            *fp = type;
+            break;
+        }
+        case SDS_TYPE_16: {
+            SDS_HDR_VAR(16,s);
+            sh->len = initlen;
+            sh->alloc = initlen;
+            *fp = type;
+            break;
+        }
+        case SDS_TYPE_32: {
+            SDS_HDR_VAR(32,s);
+            sh->len = initlen;
+            sh->alloc = initlen;
+            *fp = type;
+            break;
+        }
+        case SDS_TYPE_64: {
+            SDS_HDR_VAR(64,s);
+            sh->len = initlen;
+            sh->alloc = initlen;
+            *fp = type;
+            break;
+        }
+    }
+    s[initlen] = '\0';
+    if (initlen && init)
+        s_memcpy(s, init, initlen);
+    return s;
+}
+
+/* Duplicate an sds string. */
+sds sdsdupnvm(const sds s) {
+    return sdsnewlennvm(s, sdslen(s));
+}
+
+#endif
 
 /* Create a new sds string with the content specified by the 'init' pointer
  * and 'initlen'.
@@ -131,9 +273,9 @@ sds sdsnewlen(const void *init, size_t initlen) {
             break;
         }
     }
-    if (initlen && init)
-        memcpy(s, init, initlen);
     s[initlen] = '\0';
+    if (initlen && init)
+        s_memcpy(s, init, initlen);
     return s;
 }
 
@@ -157,6 +299,27 @@ sds sdsdup(const sds s) {
 /* Free an sds string. No operation is performed if 's' is NULL. */
 void sdsfree(sds s) {
     if (s == NULL) return;
+#ifdef SUPPORT_PBA
+    if(IS_PBA() && is_nvm_addr(s))
+    {
+        struct free_list* node = zmalloc(sizeof(struct free_list));
+        node->mstime = server.mstime;
+        node->ptr = (char*)s - sdsHdrSize(s[-1]);
+        node->next = 0;
+        if(server.pba.free_head)
+        {
+            serverAssert(server.pba.free_tail);
+            server.pba.free_tail->next = node;
+            server.pba.free_tail = node;
+        }
+        else
+        {
+            serverAssert(!server.pba.free_tail);
+            server.pba.free_head = server.pba.free_tail = node;
+        }
+        return;
+    }
+#endif
     s_free((char*)s-sdsHdrSize(s[-1]));
 }
 
@@ -227,9 +390,18 @@ sds sdsMakeRoomFor(sds s, size_t addlen) {
     } else {
         /* Since the header size changes, need to move the string forward,
          * and can't use realloc */
+        /*dennis, if the old address is nvm, make room for the nvm*/
+#ifdef USE_NVM
+        if(is_nvm_addr(sh)) {
+            newsh = s_malloc_nvm(hdrlen+newlen+1);
+        } else {
+            newsh = s_malloc(hdrlen+newlen+1);
+	}
+#else
         newsh = s_malloc(hdrlen+newlen+1);
+#endif
         if (newsh == NULL) return NULL;
-        memcpy((char*)newsh+hdrlen, s, len+1);
+        s_memcpy((char*)newsh+hdrlen, s, len+1);
         s_free(sh);
         s = (char*)newsh+hdrlen;
         s[-1] = type;
@@ -259,9 +431,17 @@ sds sdsRemoveFreeSpace(sds s) {
         if (newsh == NULL) return NULL;
         s = (char*)newsh+hdrlen;
     } else {
+#if USE_NVM
+        if(is_nvm_addr(sh)) {
+            newsh = s_malloc_nvm(hdrlen+len+1);
+        }else {
+	    newsh = s_malloc(hdrlen+len+1);
+	}
+#else
         newsh = s_malloc(hdrlen+len+1);
+#endif
         if (newsh == NULL) return NULL;
-        memcpy((char*)newsh+hdrlen, s, len+1);
+        s_memcpy((char*)newsh+hdrlen, s, len+1);
         s_free(sh);
         s = (char*)newsh+hdrlen;
         s[-1] = type;
@@ -381,7 +561,7 @@ sds sdscatlen(sds s, const void *t, size_t len) {
 
     s = sdsMakeRoomFor(s,len);
     if (s == NULL) return NULL;
-    memcpy(s+curlen, t, len);
+    s_memcpy(s+curlen, t, len);
     sdssetlen(s, curlen+len);
     s[curlen+len] = '\0';
     return s;
@@ -410,7 +590,7 @@ sds sdscpylen(sds s, const char *t, size_t len) {
         s = sdsMakeRoomFor(s,len-sdslen(s));
         if (s == NULL) return NULL;
     }
-    memcpy(s, t, len);
+    s_memcpy(s, t, len);
     s[len] = '\0';
     sdssetlen(s, len);
     return s;
@@ -611,7 +791,7 @@ sds sdscatfmt(sds s, char const *fmt, ...) {
                 if (sdsavail(s) < l) {
                     s = sdsMakeRoomFor(s,l);
                 }
-                memcpy(s+i,str,l);
+                s_memcpy(s+i,str,l);
                 sdsinclen(s,l);
                 i += l;
                 break;
@@ -627,7 +807,7 @@ sds sdscatfmt(sds s, char const *fmt, ...) {
                     if (sdsavail(s) < l) {
                         s = sdsMakeRoomFor(s,l);
                     }
-                    memcpy(s+i,buf,l);
+                    s_memcpy(s+i,buf,l);
                     sdsinclen(s,l);
                     i += l;
                 }
@@ -644,7 +824,7 @@ sds sdscatfmt(sds s, char const *fmt, ...) {
                     if (sdsavail(s) < l) {
                         s = sdsMakeRoomFor(s,l);
                     }
-                    memcpy(s+i,buf,l);
+                    s_memcpy(s+i,buf,l);
                     sdsinclen(s,l);
                     i += l;
                 }

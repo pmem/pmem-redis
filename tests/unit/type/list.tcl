@@ -2,38 +2,123 @@ start_server {
     tags {"list"}
     overrides {
         "list-max-ziplist-size" 5
+        "nvm-maxcapacity" 12
+        "nvm-dir" "/mnt/pmem4"
     }
 } {
     source "tests/unit/type/list-common.tcl"
 
+      test {[NVM] Is the data in NVM?} {
+         r flushdb
+         for {set j 0} {$j < 100000} {incr j} {
+            set size [expr 1+[randomInt 100]]
+            set buf [string repeat "abcd-$j" $size]
+            set payload1($j) $buf
+            r lpush bigpayload_$j $buf
+            r lpush bigpayload_$j $buf
+            r lpush bigpayload_$j $buf
+            r lpush bigpayload_$j $buf
+            r lpush bigpayload_$j $buf
+            r lpush bigpayload_$j $buf
+        }
+        set f [r info Memory]
+        regexp {used_nvm:(.*?)\r\n} $f - used_nvm
+        assert {$used_nvm>0}
+        r flushdb
+    }
+
+
+
     test {LPUSH, RPUSH, LLENGTH, LINDEX, LPOP - ziplist} {
         # first lpush then rpush
-        assert_equal 1 [r lpush myziplist1 aa]
-        assert_equal 2 [r rpush myziplist1 bb]
-        assert_equal 3 [r rpush myziplist1 cc]
+        set buf [string repeat "aa" 100]
+        assert_equal 1 [r lpush myziplist1 $buf]
+        set buf [string repeat "bb" 100]
+        assert_equal 2 [r rpush myziplist1 $buf]
+        set buf [string repeat "cc" 100]
+        assert_equal 3 [r rpush myziplist1 $buf]
         assert_equal 3 [r llen myziplist1]
-        assert_equal aa [r lindex myziplist1 0]
-        assert_equal bb [r lindex myziplist1 1]
-        assert_equal cc [r lindex myziplist1 2]
+        assert_equal [string repeat "aa" 100] [r lindex myziplist1 0]
+        assert_equal [string repeat "bb" 100] [r lindex myziplist1 1]
+        assert_equal [string repeat "cc" 100] [r lindex myziplist1 2]
         assert_equal {} [r lindex myziplist2 3]
-        assert_equal cc [r rpop myziplist1]
-        assert_equal aa [r lpop myziplist1]
+        assert_equal [string repeat "cc" 100] [r rpop myziplist1]
+        assert_equal [string repeat "aa" 100] [r lpop myziplist1]
         assert_encoding quicklist myziplist1
 
-        # first rpush then lpush
-        assert_equal 1 [r rpush myziplist2 a]
-        assert_equal 2 [r lpush myziplist2 b]
-        assert_equal 3 [r lpush myziplist2 c]
+        # first rpush then lpush       
+        set buf [string repeat "ax" 100]
+        assert_equal 1 [r rpush myziplist2 $buf]
+        set buf [string repeat "bx" 100]
+        assert_equal 2 [r lpush myziplist2 $buf]
+        set buf [string repeat "cx" 100]
+        assert_equal 3 [r lpush myziplist2 $buf]
         assert_equal 3 [r llen myziplist2]
-        assert_equal c [r lindex myziplist2 0]
-        assert_equal b [r lindex myziplist2 1]
-        assert_equal a [r lindex myziplist2 2]
+        assert_equal [string repeat "cx" 100] [r lindex myziplist2 0]
+        assert_equal [string repeat "bx" 100] [r lindex myziplist2 1]
+        assert_equal [string repeat "ax" 100] [r lindex myziplist2 2]
         assert_equal {} [r lindex myziplist2 3]
-        assert_equal a [r rpop myziplist2]
-        assert_equal c [r lpop myziplist2]
+        assert_equal [string repeat "ax" 100] [r rpop myziplist2]
+        assert_equal [string repeat "cx" 100] [r lpop myziplist2]
         assert_encoding quicklist myziplist2
     }
 
+    test {[NVM] list BGSAVE NVM COW} {
+        waitForBgsave r
+        r flushdb
+        r save
+        r set x 10
+        r bgsave
+        waitForBgsave r
+        r debug reload
+        assert_equal 10 [r get x] 
+
+        array set payload {}
+        array set payload1 {}
+        for {set j 0} {$j < 100000} {incr j} {
+            set size [expr 1+[randomInt 100]]
+            set buf [string repeat "abcd-$j" $size]
+            set payload1($j) $buf
+            r lpush bigpayload_$j $buf
+            r lpush bigpayload_$j $buf
+            r lpush bigpayload_$j $buf
+            r lpush bigpayload_$j $buf
+            r lpush bigpayload_$j $buf
+            r lpush bigpayload_$j $buf
+        }
+        r bgsave
+        for {set j 0} {$j < 100} {incr j} {
+            set size [expr 1+[randomInt 100]]
+            set buf [string repeat "cdef-$j" $size]
+            set payload($j) $buf
+            r rpop bigpayload_$j
+            r lpush bigpayload_$j $buf
+            r lpush bigpayload_$j $buf
+            r lpush bigpayload_$j $buf
+        }
+        waitForBgsave r           
+        set i [r info persistence]
+        regexp {rdb_last_nvm_cow_size:(.*?)\r\n} $i - cowsize
+        assert { $cowsize>1 }
+        #regexp {rdb_last_bgsave_time_sec:(.*?)\r\n} $i - time
+        #assert { $time>0 }
+
+        for {set j 0} {$j < 100} {incr j} {
+            assert_equal $payload($j) [r lpop bigpayload_$j]  
+        }
+    
+        #puts "r debug reload" reload is doing the save and then reload. 
+        #here we would like just load.  
+        r debug loadrdb
+        for {set j 0} {$j < 100} {incr j} {
+            assert_equal $payload1($j) [r lpop bigpayload_$j]  
+        }     
+        
+        unset payload
+        unset payload1
+    }
+
+   
     test {LPUSH, RPUSH, LLENGTH, LINDEX, LPOP - regular list} {
         # first lpush then rpush
         assert_equal 1 [r lpush mylist1 $largevalue(linkedlist)]

@@ -1,4 +1,13 @@
-start_server {tags {"zset"}} {
+start_server {
+   tags {"zset"}
+   overrides {
+        "nvm-maxcapacity" 10
+        "nvm-dir" "/mnt/pmem4/"
+        "nvm-threshold" 64
+        "maxmemory" 1073741824
+        "maxmemory-policy" "allkeys-lru"
+    }
+} {
     proc create_zset {key items} {
         r del $key
         foreach {score entry} $items {
@@ -17,6 +26,118 @@ start_server {tags {"zset"}} {
             puts "Unknown sorted set encoding"
             exit
         }
+       
+        test {[NVM] bgsave NVM COW} {
+          waitForBgsave r
+          r flushdb
+
+          for {set i 0} {$i < 1000} {incr i} {
+            for {set j 1} {$j < 4} {incr j} {
+                  r zadd nvm_zset_$i $j xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx_$i
+            }        
+          }
+
+          set f [r info Memory]
+          regexp {used_nvm:(.*?)\r\n} $f - used_nvm
+          assert {$used_nvm>0}
+
+          r bgsave
+
+          for {set i 0} {$i < 200} {incr i} {
+            for {set j 1} {$j < 4} {incr j} {
+                  r zadd nvm_zset_$i $j yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy_$i
+             }
+          }
+          
+          for {set i 0} {$i < 200} {incr i} {
+              r del nvm_zset_$i
+          }
+
+
+
+          waitForBgsave r
+
+          set i [r info persistence]
+          regexp {rdb_last_nvm_cow_size:(.*?)\r\n} $i - cowsize
+          assert {$cowsize>0}
+        }    
+ 
+
+
+       test {[NVM] ZADD/ZRANGE - using string larger than 64 bit  } {
+           r del nvm_zset
+           r zadd nvm_zset 1 "one_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+           r zadd nvm_zset 2 "two_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+           r zadd nvm_zset 3 "three_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+           assert_equal {one_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx two_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx three_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx} [r zrange nvm_zset 0 -1]
+       }
+
+       test {[NVM] Is the data in NVM?} {
+           set i [r info Memory]
+           regexp {used_nvm:(.*?)\r\n} $i - used_nvm
+           assert {$used_nvm>0}
+       }
+
+       test {[NVM] ZREM - removes key after last element is removed} {
+            r del ztmp
+            r zadd ztmp 10 x_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+            r zadd ztmp 20 y_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+            assert_equal 1 [r exists ztmp]
+            assert_equal 0 [r zrem ztmp z_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]
+            assert_equal 1 [r zrem ztmp y_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]
+            assert_equal 1 [r zrem ztmp x_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]
+            assert_equal 0 [r exists ztmp]
+        }
+
+        test {[NVM] ZREM - variadic version} {
+            r del ztmp
+            r zadd ztmp 10 a_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx 20 b_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx 30 c_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+            assert_equal 2 [r zrem ztmp x y a_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx b_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx k]
+            assert_equal 0 [r zrem ztmp foo bar]
+            assert_equal 1 [r zrem ztmp c_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]
+            r exists ztmp
+        } {0}
+
+        test {[NVM] ZREM - variadic version -- remove elements after key deletion} {
+            r del ztmp
+            r zadd ztmp 10 a_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx 20 b_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx 30 c_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+            r zrem ztmp a _xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx b_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx c_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx d e f g
+        } {2}
+
+        
+         test {[NVM] ZRANK/ZREVRANK basics - $encoding} {
+            r del zranktmp
+            r zadd zranktmp 10 x_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+            r zadd zranktmp 20 y_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+            r zadd zranktmp 30 z_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+            assert_equal 0 [r zrank zranktmp x_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]
+            assert_equal 1 [r zrank zranktmp y_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]
+            assert_equal 2 [r zrank zranktmp z_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]
+            assert_equal "" [r zrank zranktmp foo_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]
+            assert_equal 2 [r zrevrank zranktmp x_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]
+            assert_equal 1 [r zrevrank zranktmp y_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]
+            assert_equal 0 [r zrevrank zranktmp z_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]
+            assert_equal "" [r zrevrank zranktmp foo_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]
+        }
+
+
+
+        test {[NVM] ZRANK - after deletion} {
+            r zrem zranktmp y_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+            assert_equal 0 [r zrank zranktmp x_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]
+            assert_equal 1 [r zrank zranktmp z_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]
+        }
+
+        test {[NVM] ZINCRBY - can create a new sorted set - $encoding"} {
+            r del zset
+            r zincrby zset 1 foo_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+            assert_equal {foo_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx} [r zrange zset 0 -1]
+            assert_equal 1 [r zscore zset foo_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx]
+        }
+
+
 
         test "Check encoding - $encoding" {
             r del ztmp

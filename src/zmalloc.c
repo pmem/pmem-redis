@@ -1,5 +1,6 @@
 /* zmalloc - total amount of allocated memory aware version of malloc()
  *
+ * Copyright (c) 2018, Intel Corporation
  * Copyright (c) 2009-2010, Salvatore Sanfilippo <antirez at gmail dot com>
  * All rights reserved.
  *
@@ -27,7 +28,6 @@
  * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
  * POSSIBILITY OF SUCH DAMAGE.
  */
-
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -44,6 +44,7 @@ void zlibc_free(void *ptr) {
 #include "config.h"
 #include "zmalloc.h"
 #include "atomicvar.h"
+#include "assert.h"
 
 #ifdef HAVE_MALLOC_SIZE
 #define PREFIX_SIZE (0)
@@ -85,6 +86,15 @@ void zlibc_free(void *ptr) {
 static size_t used_memory = 0;
 pthread_mutex_t used_memory_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+#ifdef USE_NVM
+static int use_nvm = 0;
+static int (*is_nvm_addr)(const void* ptr) = NULL;
+static size_t (*nvm_usable_size)(void* ptr) = NULL;
+static void* (*nvm_malloc)(size_t size) = NULL;
+static int (*nvm_free)(void* ptr) = NULL;
+static size_t (*nvm_get_used)(void) = NULL;
+#endif
+
 static void zmalloc_default_oom(size_t size) {
     fprintf(stderr, "zmalloc: Out of memory trying to allocate %zu bytes\n",
         size);
@@ -94,7 +104,39 @@ static void zmalloc_default_oom(size_t size) {
 
 static void (*zmalloc_oom_handler)(size_t) = zmalloc_default_oom;
 
-void *zmalloc(size_t size) {
+#ifdef USE_NVM
+void zmalloc_init_nvm(int (*_is_nvm_addr)(const void *),
+                      size_t (*_nvm_usable_size)(void*),
+                      void* (*_nvm_malloc)(size_t),
+                      int (*_nvm_free)(void*),
+                      size_t (*_nvm_get_used)(void)) {
+    assert(_is_nvm_addr && _nvm_usable_size && _nvm_malloc && _nvm_free && _nvm_get_used);
+    is_nvm_addr = _is_nvm_addr;
+    nvm_usable_size = _nvm_usable_size;
+    nvm_malloc = _nvm_malloc;
+    nvm_free = _nvm_free;
+    nvm_get_used = _nvm_get_used;
+    use_nvm = 1;
+}
+static size_t  nvm_threshold=64;
+static struct memkind *kindofpmem=NULL;
+
+void zmalloc_get_nvm_config(size_t sdsmv_threshold, struct memkind *pmem_kind)
+{
+   nvm_threshold=sdsmv_threshold;
+   kindofpmem=pmem_kind; 
+}
+
+#endif
+
+void *s_zmalloc(size_t size) {
+#ifdef USE_NVM
+    if(use_nvm && kindofpmem!=NULL && size>=nvm_threshold) {
+        void *ptr = nvm_malloc(size+PREFIX_SIZE);  
+        if(ptr) return ptr;
+    }
+#endif
+
     void *ptr = malloc(size+PREFIX_SIZE);
 
     if (!ptr) zmalloc_oom_handler(size);
@@ -108,6 +150,20 @@ void *zmalloc(size_t size) {
 #endif
 }
 
+void *zmalloc(size_t size) {
+
+    void *ptr = malloc(size+PREFIX_SIZE);
+
+    if (!ptr) zmalloc_oom_handler(size);
+#ifdef HAVE_MALLOC_SIZE
+    update_zmalloc_stat_alloc(zmalloc_size(ptr));
+    return ptr;
+#else
+    *((size_t*)ptr) = size;
+    update_zmalloc_stat_alloc(size+PREFIX_SIZE);
+    return (char*)ptr+PREFIX_SIZE;
+#endif
+}
 /* Allocation and free functions that bypass the thread cache
  * and go straight to the allocator arena bins.
  * Currently implemented only for jemalloc. Used for online defragmentation. */
@@ -148,6 +204,24 @@ void *zrealloc(void *ptr, size_t size) {
     void *newptr;
 
     if (ptr == NULL) return zmalloc(size);
+
+#ifdef USE_NVM
+    if (use_nvm && is_nvm_addr(ptr)) {
+        oldsize = nvm_usable_size(ptr);
+        if (oldsize / 2 <= size && size <= oldsize)
+            return ptr;
+        void* new_ptr = nvm_malloc(size);
+        if (!new_ptr)
+            new_ptr = zmalloc(size);
+        if (new_ptr) {
+            size_t cp_size = size < oldsize ? size : oldsize;
+            memcpy(new_ptr, ptr, cp_size);
+            zfree(ptr);
+        }
+        return new_ptr;
+    }
+#endif
+
 #ifdef HAVE_MALLOC_SIZE
     oldsize = zmalloc_size(ptr);
     newptr = realloc(ptr,size);
@@ -190,6 +264,14 @@ void zfree(void *ptr) {
 #endif
 
     if (ptr == NULL) return;
+
+#ifdef USE_NVM
+    if(use_nvm && is_nvm_addr(ptr)) {
+        nvm_free(ptr);
+        return;
+    }
+#endif
+
 #ifdef HAVE_MALLOC_SIZE
     update_zmalloc_stat_free(zmalloc_size(ptr));
     free(ptr);

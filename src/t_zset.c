@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2018, Intel Corporation
  * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
  * Copyright (c) 2009-2012, Pieter Noordhuis <pcnoordhuis at gmail dot com>
  * All rights reserved.
@@ -59,9 +60,9 @@
 #include "server.h"
 #include <math.h>
 
-/*-----------------------------------------------------------------------------
- * Skiplist implementation of the low level API
- *----------------------------------------------------------------------------*/
+#ifdef USE_NVM
+#include "nvm.h"
+#endif
 
 int zslLexValueGteMin(sds value, zlexrangespec *spec);
 int zslLexValueLteMax(sds value, zlexrangespec *spec);
@@ -355,11 +356,14 @@ unsigned long zslDeleteRangeByScore(zskiplist *zsl, zrangespec *range, dict *dic
     return removed;
 }
 
+#ifdef SUPPORT_PBA
+unsigned long zslDeleteRangeByLex(zskiplist *zsl, zlexrangespec *range, dict *dict, client* c, robj* key) {
+#else
 unsigned long zslDeleteRangeByLex(zskiplist *zsl, zlexrangespec *range, dict *dict) {
+#endif
     zskiplistNode *update[ZSKIPLIST_MAXLEVEL], *x;
     unsigned long removed = 0;
     int i;
-
 
     x = zsl->header;
     for (i = zsl->level-1; i >= 0; i--) {
@@ -372,15 +376,47 @@ unsigned long zslDeleteRangeByLex(zskiplist *zsl, zlexrangespec *range, dict *di
     /* Current node is the last with score < or <= min. */
     x = x->level[0].forward;
 
+#ifdef SUPPORT_PBA
+    int is_pba = IS_PBA();
+    robj* propargv[3];
+    if(is_pba)
+    {
+        propargv[0] = createStringObject("ZREM", 4);
+        propargv[1] = key;
+    }
+#endif
+
     /* Delete nodes while in range. */
     while (x && zslLexValueLteMax(x->ele,range)) {
         zskiplistNode *next = x->level[0].forward;
         zslDeleteNode(zsl,x,update);
         dictDelete(dict,x->ele);
+#ifdef SUPPORT_PBA
+        if(is_pba)
+        {
+            if(is_nvm_addr(x->ele))
+            {
+                propargv[2] = createObject(OBJ_STRING, x->ele);
+                propargv[2]->no_free_val = 1;
+            }
+            else
+                propargv[2] = createObject(OBJ_STRING, sdsdup(x->ele));
+            alsoPropagate(server.pba.zremCommand, c->db->id, propargv, 3, PROPAGATE_AOF);
+            decrRefCount(propargv[2]);
+        }
+#endif
         zslFreeNode(x); /* Here is where x->ele is actually released. */
         removed++;
         x = next;
     }
+
+#ifdef SUPPORT_PBA
+    if(is_pba)
+    {
+        decrRefCount(propargv[0]);
+        preventCommandAOF(c);
+    }
+#endif
     return removed;
 }
 
@@ -1060,7 +1096,11 @@ unsigned char *zzlDeleteRangeByScore(unsigned char *zl, zrangespec *range, unsig
     return zl;
 }
 
+#ifdef SUPPORT_PBA
+unsigned char *zzlDeleteRangeByLex(unsigned char *zl, zlexrangespec *range, unsigned long *deleted, client* c, robj* key) {
+#else
 unsigned char *zzlDeleteRangeByLex(unsigned char *zl, zlexrangespec *range, unsigned long *deleted) {
+#endif
     unsigned char *eptr, *sptr;
     unsigned long num = 0;
 
@@ -1069,11 +1109,39 @@ unsigned char *zzlDeleteRangeByLex(unsigned char *zl, zlexrangespec *range, unsi
     eptr = zzlFirstInLexRange(zl,range);
     if (eptr == NULL) return zl;
 
+#ifdef SUPPORT_PBA
+    int is_pba = IS_PBA();
+    robj* propargv[3];
+    if(is_pba)
+    {
+        propargv[0] = createStringObject("ZREM", 4);
+        propargv[1] = key;
+    }
+#endif
+
     /* When the tail of the ziplist is deleted, eptr will point to the sentinel
      * byte and ziplistNext will return NULL. */
     while ((sptr = ziplistNext(zl,eptr)) != NULL) {
         if (zzlLexValueLteMax(eptr,range)) {
             /* Delete both the element and the score. */
+#ifdef SUPPORT_PBA
+            if(is_pba)
+            {
+                unsigned char *sval = NULL;
+                unsigned int slen;
+                long long lval;
+                ziplistGet(eptr, &sval, &slen, &lval);
+                if(is_nvm_addr(sval))
+                {
+                    propargv[2] = createObject(OBJ_STRING, sval);
+                    propargv[2]->no_free_val = 1;
+                }
+                else
+                    propargv[2] = createStringObject((char*)sval, slen);
+                alsoPropagate(server.pba.zremCommand, c->db->id, propargv, 3, PROPAGATE_AOF);
+                decrRefCount(propargv[2]);
+            }
+#endif
             zl = ziplistDelete(zl,&eptr);
             zl = ziplistDelete(zl,&eptr);
             num++;
@@ -1082,6 +1150,14 @@ unsigned char *zzlDeleteRangeByLex(unsigned char *zl, zlexrangespec *range, unsi
             break;
         }
     }
+
+#ifdef SUPPORT_PBA
+    if(is_pba)
+    {
+        decrRefCount(propargv[0]);
+        preventCommandAOF(c);
+    }
+#endif
 
     if (deleted != NULL) *deleted = num;
     return zl;
@@ -1117,7 +1193,6 @@ void zsetConvert(robj *zobj, int encoding) {
     zskiplistNode *node, *next;
     sds ele;
     double score;
-
     if (zobj->encoding == encoding) return;
     if (zobj->encoding == OBJ_ENCODING_ZIPLIST) {
         unsigned char *zl = zobj->ptr;
@@ -1143,8 +1218,13 @@ void zsetConvert(robj *zobj, int encoding) {
             serverAssertWithInfo(NULL,zobj,ziplistGet(eptr,&vstr,&vlen,&vlong));
             if (vstr == NULL)
                 ele = sdsfromlonglong(vlong);
-            else
+#ifdef USE_NVM
+            else if(is_nvm_addr(vstr)&& !IS_EMBED_IN_ZIPLIST(vstr,zl))
+                ele = (sds)vstr;
+#endif
+            else {
                 ele = sdsnewlen((char*)vstr,vlen);
+            }
 
             node = zslInsert(zs->zsl,score,ele);
             serverAssert(dictAdd(zs->dict,ele,&node->score) == DICT_OK);
@@ -1152,6 +1232,7 @@ void zsetConvert(robj *zobj, int encoding) {
         }
 
         zfree(zobj->ptr);
+
         zobj->ptr = zs;
         zobj->encoding = OBJ_ENCODING_SKIPLIST;
     } else if (zobj->encoding == OBJ_ENCODING_SKIPLIST) {
@@ -1171,10 +1252,12 @@ void zsetConvert(robj *zobj, int encoding) {
         while (node) {
             zl = zzlInsertAt(zl,NULL,node->ele,node->score);
             next = node->level[0].forward;
+#ifdef USE_NVM
+            node->ele = NULL;
+#endif
             zslFreeNode(node);
             node = next;
         }
-
         zfree(zs);
         zobj->ptr = zl;
         zobj->encoding = OBJ_ENCODING_ZIPLIST;
@@ -1265,11 +1348,13 @@ int zsetAdd(robj *zobj, double score, sds ele, int *flags, double *newscore) {
     int xx = (*flags & ZADD_XX) != 0;
     *flags = 0; /* We'll return our response flags. */
     double curscore;
+    int ret = 0;
 
     /* NaN as input is an error regardless of all the other parameters. */
     if (isnan(score)) {
         *flags = ZADD_NAN;
-        return 0;
+        ret = 0;
+        goto out;
     }
 
     /* Update the sorted set according to its encoding. */
@@ -1280,7 +1365,8 @@ int zsetAdd(robj *zobj, double score, sds ele, int *flags, double *newscore) {
             /* NX? Return, same element already exists. */
             if (nx) {
                 *flags |= ZADD_NOP;
-                return 1;
+                ret = 1;
+                goto out;
             }
 
             /* Prepare the score for the increment if needed. */
@@ -1288,7 +1374,8 @@ int zsetAdd(robj *zobj, double score, sds ele, int *flags, double *newscore) {
                 score += curscore;
                 if (isnan(score)) {
                     *flags |= ZADD_NAN;
-                    return 0;
+                    ret = 0;
+                    goto out;
                 }
                 if (newscore) *newscore = score;
             }
@@ -1303,7 +1390,22 @@ int zsetAdd(robj *zobj, double score, sds ele, int *flags, double *newscore) {
         } else if (!xx) {
             /* Optimize: check if the element is too large or the list
              * becomes too long *before* executing zzlInsert. */
-            zobj->ptr = zzlInsert(zobj->ptr,ele,score);
+            /*only update the value and only duplicate the value to NVM*/
+             sds zele = ele;
+ #ifdef USE_NVM
+             if(sdslen(zele)> server.sdsmv_threshold)
+             {
+                 sds e = sdsdupnvm(zele);
+                 if(!is_nvm_addr(e))
+                     sdsfree(e);
+                 else
+                     zele = e;
+             }
+#endif
+#ifdef SUPPORT_PBA
+            setArgPBA(zele);
+#endif
+            zobj->ptr = zzlInsert(zobj->ptr,zele,score);
             if (zzlLength(zobj->ptr) > server.zset_max_ziplist_entries)
                 zsetConvert(zobj,OBJ_ENCODING_SKIPLIST);
             if (sdslen(ele) > server.zset_max_ziplist_value)
@@ -1325,7 +1427,8 @@ int zsetAdd(robj *zobj, double score, sds ele, int *flags, double *newscore) {
             /* NX? Return, same element already exists. */
             if (nx) {
                 *flags |= ZADD_NOP;
-                return 1;
+                ret = 1;
+                goto out;
             }
             curscore = *(double*)dictGetVal(de);
 
@@ -1334,7 +1437,8 @@ int zsetAdd(robj *zobj, double score, sds ele, int *flags, double *newscore) {
                 score += curscore;
                 if (isnan(score)) {
                     *flags |= ZADD_NAN;
-                    return 0;
+                    ret = 0;
+                    goto out;
                 }
                 if (newscore) *newscore = score;
             }
@@ -1356,7 +1460,14 @@ int zsetAdd(robj *zobj, double score, sds ele, int *flags, double *newscore) {
             }
             return 1;
         } else if (!xx) {
+#ifdef USE_NVM
+            ele = sdsdupnvm(ele);
+#else
             ele = sdsdup(ele);
+#endif
+#ifdef SUPPORT_PBA
+            setArgPBA(ele);
+#endif
             znode = zslInsert(zs->zsl,score,ele);
             serverAssert(dictAdd(zs->dict,ele,&znode->score) == DICT_OK);
             *flags |= ZADD_ADDED;
@@ -1370,6 +1481,9 @@ int zsetAdd(robj *zobj, double score, sds ele, int *flags, double *newscore) {
         serverPanic("Unknown sorted set encoding");
     }
     return 0; /* Never reached. */
+
+out:
+    return ret; 
 }
 
 /* Delete the element 'ele' from the sorted set, returning 1 if the element
@@ -1379,6 +1493,16 @@ int zsetDel(robj *zobj, sds ele) {
         unsigned char *eptr;
 
         if ((eptr = zzlFind(zobj->ptr,ele,NULL)) != NULL) {
+#ifdef SUPPORT_PBA
+            if(IS_PBA())
+            {
+                unsigned char *sval = NULL;
+                unsigned int slen;
+                long long lval;
+                ziplistGet(eptr, &sval, &slen, &lval);
+                setArgPBA((sds)sval);
+            }
+#endif
             zobj->ptr = zzlDelete(zobj->ptr,eptr);
             return 1;
         }
@@ -1392,6 +1516,10 @@ int zsetDel(robj *zobj, sds ele) {
             /* Get the score in order to delete from the skiplist later. */
             score = *(double*)dictGetVal(de);
 
+#ifdef SUPPORT_PBA
+            sds ele = dictGetKey(de);
+            setArgPBA(ele);
+#endif
             /* Delete from the hash table and later from the skiplist.
              * Note that the order is important: deleting from the skiplist
              * actually releases the SDS string representing the element,
@@ -1572,7 +1700,9 @@ void zaddGenericCommand(client *c, int flags) {
         double newscore;
         score = scores[j];
         int retflags = flags;
-
+#ifdef SUPPORT_PBA
+        server.pba.arg = c->argv[scoreidx + 1 + j * 2];
+#endif
         ele = c->argv[scoreidx+1+j*2]->ptr;
         int retval = zsetAdd(zobj, score, ele, &retflags, &newscore);
         if (retval == 0) {
@@ -1622,6 +1752,9 @@ void zremCommand(client *c) {
         checkType(c,zobj,OBJ_ZSET)) return;
 
     for (j = 2; j < c->argc; j++) {
+#ifdef SUPPORT_PBA
+        server.pba.arg = c->argv[j];
+#endif
         if (zsetDel(zobj,c->argv[j]->ptr)) deleted++;
         if (zsetLength(zobj) == 0) {
             dbDelete(c->db,key);
@@ -1700,7 +1833,11 @@ void zremrangeGenericCommand(client *c, int rangetype) {
             zobj->ptr = zzlDeleteRangeByScore(zobj->ptr,&range,&deleted);
             break;
         case ZRANGE_LEX:
+#ifdef SUPPORT_PBA
+            zobj->ptr = zzlDeleteRangeByLex(zobj->ptr, &lexrange, &deleted, c, key);
+#else
             zobj->ptr = zzlDeleteRangeByLex(zobj->ptr,&lexrange,&deleted);
+#endif
             break;
         }
         if (zzlLength(zobj->ptr) == 0) {
@@ -1717,7 +1854,11 @@ void zremrangeGenericCommand(client *c, int rangetype) {
             deleted = zslDeleteRangeByScore(zs->zsl,&range,zs->dict);
             break;
         case ZRANGE_LEX:
+#ifdef SUPPORT_PBA
+            deleted = zslDeleteRangeByLex(zs->zsl,&lexrange,zs->dict, c, key);
+#else
             deleted = zslDeleteRangeByLex(zs->zsl,&lexrange,zs->dict);
+#endif
             break;
         }
         if (htNeedsResize(zs->dict)) dictResize(zs->dict);
@@ -2008,9 +2149,17 @@ sds zuiNewSdsFromValue(zsetopval *val) {
         val->ele = NULL;
         return ele;
     } else if (val->ele) {
+#ifdef USE_NVM
+        return sdsdupnvm(val->ele);
+#else
         return sdsdup(val->ele);
+#endif
     } else if (val->estr) {
+#ifdef USE_NVM
+        return sdsnewlennvm((char*)val->estr,val->elen);
+#else
         return sdsnewlen((char*)val->estr,val->elen);
+#endif
     } else {
         return sdsfromlonglong(val->ell);
     }
@@ -2087,6 +2236,73 @@ int zuiFind(zsetopsrc *op, zsetopval *val, double *score) {
 int zuiCompareByCardinality(const void *s1, const void *s2) {
     return zuiLength((zsetopsrc*)s1) - zuiLength((zsetopsrc*)s2);
 }
+
+#ifdef SUPPORT_PBA
+void propagateZsetWithZADD(client* c, robj* zset, int deleted)
+{
+    robj* propargv[4];
+    propargv[1] = c->argv[1];
+    if(deleted)
+    {
+        propargv[0] = createStringObject("DEL", 3);
+        alsoPropagate(server.delCommand, c->db->id, propargv, 2, PROPAGATE_AOF);
+        decrRefCount(propargv[0]);
+    }
+    propargv[0] = createStringObject("ZADD", 4);
+    if(zset->encoding == OBJ_ENCODING_ZIPLIST)
+    {
+        unsigned char *zl = zset->ptr;
+        unsigned char* eptr = ziplistIndex(zl, 0);
+        unsigned char* sptr = ziplistNext(zl, eptr);
+        while(eptr)
+        {
+            double score = zzlGetScore(sptr);
+            propargv[2] = createStringObjectFromLongDouble(score, 0);
+            unsigned char *vstr = NULL;
+            unsigned int vlen;
+            long long vlong;
+            ziplistGet(eptr, &vstr, &vlen, &vlong);
+            if(!vstr)
+                propargv[3] = createStringObjectFromLongLong(vlong);
+            else if(is_nvm_addr(vstr))
+            {
+                propargv[3] = createObject(OBJ_STRING, vstr);
+                propargv[3]->no_free_val = 1;
+            }
+            else
+                propargv[3] = createStringObject((char*)vstr, vlen);
+            alsoPropagate(server.pba.zaddCommand, c->db->id, propargv, 4, PROPAGATE_AOF);
+            decrRefCount(propargv[2]);
+            decrRefCount(propargv[3]);
+            zzlNext(zl,&eptr,&sptr);
+        }
+    }
+    else if(zset->encoding == OBJ_ENCODING_SKIPLIST)
+    {
+        struct zset* z = zset->ptr;
+        dictIterator* iter = dictGetIterator(z->dict);
+        dictEntry* entry;
+        while((entry = dictNext(iter)))
+        {
+            sds ele = dictGetKey(entry);
+            double score = (*((double*)dictGetVal(entry)));
+            propargv[2] = createStringObjectFromLongDouble(score, 0);
+            if(is_nvm_addr(ele))
+            {
+                propargv[3] = createObject(OBJ_STRING, ele);
+                propargv[3]->no_free_val = 1;
+            }
+            else
+                propargv[3] = createObject(OBJ_STRING, sdsdup(ele));
+            alsoPropagate(server.pba.zaddCommand, c->db->id, propargv, 4, PROPAGATE_AOF);
+            decrRefCount(propargv[2]);
+            decrRefCount(propargv[3]);
+        }
+    }
+    decrRefCount(propargv[0]);
+    preventCommandAOF(c);
+}
+#endif
 
 #define REDIS_AGGR_SUM 1
 #define REDIS_AGGR_MIN 2
@@ -2251,6 +2467,10 @@ void zunionInterGenericCommand(client *c, robj *dstkey, int op) {
                 /* Only continue when present in every input. */
                 if (j == setnum) {
                     tmp = zuiNewSdsFromValue(&zval);
+#ifdef USE_NVM
+                    if(!is_nvm_addr(tmp))
+                        tmp = sdsmvtonvm(tmp);
+#endif
                     znode = zslInsert(dstzset->zsl,score,tmp);
                     dictAdd(dstzset->dict,tmp,&znode->score);
                     if (sdslen(tmp) > maxelelen) maxelelen = sdslen(tmp);
@@ -2286,6 +2506,10 @@ void zunionInterGenericCommand(client *c, robj *dstkey, int op) {
                 /* If we don't have it, we need to create a new entry. */
                 if (!existing) {
                     tmp = zuiNewSdsFromValue(&zval);
+#ifdef USE_NVM
+                    if(!is_nvm_addr(tmp))
+                        tmp = sdsmvtonvm(tmp);
+#endif
                     /* Remember the longest single element encountered,
                      * to understand if it's possible to convert to ziplist
                      * at the end. */
@@ -2331,6 +2555,10 @@ void zunionInterGenericCommand(client *c, robj *dstkey, int op) {
     if (dstzset->zsl->length) {
         zsetConvertToZiplistIfNeeded(dstobj,maxelelen);
         dbAdd(c->db,dstkey,dstobj);
+#ifdef SUPPORT_PBA
+        if(IS_PBA())
+            propagateZsetWithZADD(c, dstobj, touched);
+#endif
         addReplyLongLong(c,zsetLength(dstobj));
         signalModifiedKey(c->db,dstkey);
         notifyKeyspaceEvent(NOTIFY_ZSET,

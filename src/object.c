@@ -1,5 +1,6 @@
 /* Redis Object implementation.
  *
+ * Copyright (c) 2018, Intel Corporation
  * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
  * All rights reserved.
  *
@@ -31,6 +32,9 @@
 #include "server.h"
 #include <math.h>
 #include <ctype.h>
+#ifdef USE_NVM
+#include "nvm.h"
+#endif
 
 #ifdef __CYGWIN__
 #define strtold(a,b) ((long double)strtod((a),(b)))
@@ -45,6 +49,12 @@ robj *createObject(int type, void *ptr) {
     o->ptr = ptr;
     o->refcount = 1;
 
+#ifdef USE_NVM
+    o->need_mv_to_nvm = 0;
+#endif
+#ifdef SUPPORT_PBA
+    o->no_free_val = 0;
+#endif
     /* Set the LRU to the current lruclock (minutes resolution), or
      * alternatively the LFU counter. */
     if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) {
@@ -89,6 +99,13 @@ robj *createEmbeddedStringObject(const char *ptr, size_t len) {
     o->encoding = OBJ_ENCODING_EMBSTR;
     o->ptr = sh+1;
     o->refcount = 1;
+
+#ifdef USE_NVM
+    o->need_mv_to_nvm = 0;
+#endif
+#ifdef SUPPORT_PBA
+    o->no_free_val = 0;
+#endif
     if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) {
         o->lru = (LFUGetTimeInMinutes()<<8) | LFU_INIT_VAL;
     } else {
@@ -241,7 +258,14 @@ robj *createModuleObject(moduleType *mt, void *value) {
 
 void freeStringObject(robj *o) {
     if (o->encoding == OBJ_ENCODING_RAW) {
-        sdsfree(o->ptr);
+#ifdef SUPPORT_PBA
+        if(o->no_free_val)
+        {
+            serverAssert(is_nvm_addr(o->ptr));
+            return;
+        }
+#endif
+        sdsfree(o->ptr);       
     }
 }
 
@@ -271,12 +295,16 @@ void freeZsetObject(robj *o) {
     switch (o->encoding) {
     case OBJ_ENCODING_SKIPLIST:
         zs = o->ptr;
-        dictRelease(zs->dict);
+        dictRelease(zs->dict);   
         zslFree(zs->zsl);
         zfree(zs);
         break;
     case OBJ_ENCODING_ZIPLIST:
+#ifdef USE_NVM
+        ziplistFree(o->ptr);
+#else
         zfree(o->ptr);
+#endif
         break;
     default:
         serverPanic("Unknown sorted set encoding");
@@ -289,7 +317,12 @@ void freeHashObject(robj *o) {
         dictRelease((dict*) o->ptr);
         break;
     case OBJ_ENCODING_ZIPLIST:
+#ifdef USE_NVM
+        ziplistFree(o->ptr);
+#else
         zfree(o->ptr);
+#endif
+
         break;
     default:
         serverPanic("Unknown hash encoding type");
@@ -377,6 +410,10 @@ robj *tryObjectEncoding(robj *o) {
     sds s = o->ptr;
     size_t len;
 
+#ifdef USE_NVM
+    if(is_nvm_addr(s))
+        return o;
+#endif
     /* Make sure this is a string object, the only type we encode
      * in this function. Other types use encoded memory efficient
      * representations but are handled by the commands implementing

@@ -5,7 +5,8 @@ proc randstring {min max {type binary}} {
         set minval 0
         set maxval 255
     } elseif {$type eq {alpha}} {
-        set minval 48
+        set minval 64 
+        #48
         set maxval 122
     } elseif {$type eq {compr}} {
         set minval 48

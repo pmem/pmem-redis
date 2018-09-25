@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2018, Intel Corporation
  * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
  * All rights reserved.
  *
@@ -29,6 +30,9 @@
 
 #include "server.h"
 #include <math.h>
+#ifdef USE_NVM
+#include "nvm.h"
+#endif
 
 /*-----------------------------------------------------------------------------
  * Hash type API
@@ -204,7 +208,6 @@ int hashTypeSet(robj *o, sds field, sds value, int flags) {
 
     if (o->encoding == OBJ_ENCODING_ZIPLIST) {
         unsigned char *zl, *fptr, *vptr;
-
         zl = o->ptr;
         fptr = ziplistIndex(zl, ZIPLIST_HEAD);
         if (fptr != NULL) {
@@ -218,17 +221,57 @@ int hashTypeSet(robj *o, sds field, sds value, int flags) {
                 /* Delete value */
                 zl = ziplistDelete(zl, &vptr);
 
+                /*only update the value and only duplicate the value to NVM*/
+                sds ele = value;
+#ifdef USE_NVM
+                if(sdslen(ele)> server.sdsmv_threshold)
+                {
+                    sds e = sdsdupnvm(ele);
+                    if(!is_nvm_addr(e))
+                        sdsfree(e);
+                    else
+                        ele = e;
+                }
+#endif
+#ifdef SUPPORT_PBA
+                setArgPBA(ele);
+#endif
                 /* Insert new value */
-                zl = ziplistInsert(zl, vptr, (unsigned char*)value,
+                zl = ziplistInsert(zl, vptr, (unsigned char*)ele,
                         sdslen(value));
             }
         }
 
         if (!update) {
+           /* update the value and filed duplicate the value to NVM*/
+           sds vele = value;
+           sds fele = field;
+#ifdef USE_NVM
+            if(sdslen(vele)> server.sdsmv_threshold)
+            {
+                sds e = sdsdupnvm(vele);
+                if(!is_nvm_addr(e))
+                    sdsfree(e);
+                else
+                    vele = e;
+            }
+
+            if(sdslen(fele)> server.sdsmv_threshold)
+            {
+                sds e = sdsdupnvm(fele);
+                if(!is_nvm_addr(e))
+                    sdsfree(e);
+                else
+                    fele = e;
+            }
+#endif
+#ifdef SUPPORT_PBA
+            setArgPBA(vele);
+#endif
             /* Push new field/value pair onto the tail of the ziplist */
-            zl = ziplistPush(zl, (unsigned char*)field, sdslen(field),
+            zl = ziplistPush(zl, (unsigned char*)fele, sdslen(fele),
                     ZIPLIST_TAIL);
-            zl = ziplistPush(zl, (unsigned char*)value, sdslen(value),
+            zl = ziplistPush(zl, (unsigned char*)vele, sdslen(vele),
                     ZIPLIST_TAIL);
         }
         o->ptr = zl;
@@ -244,7 +287,14 @@ int hashTypeSet(robj *o, sds field, sds value, int flags) {
                 dictGetVal(de) = value;
                 value = NULL;
             } else {
+#ifdef USE_NVM
+                dictGetVal(de) = sdsdupnvm(value);
+#else
                 dictGetVal(de) = sdsdup(value);
+#endif
+#ifdef SUPPORT_PBA
+                setArgPBA(dictGetVal(de));
+#endif
             }
             update = 1;
         } else {
@@ -253,13 +303,24 @@ int hashTypeSet(robj *o, sds field, sds value, int flags) {
                 f = field;
                 field = NULL;
             } else {
+#ifdef USE_NVM
+                f = sdsdupnvm(field);
+#else
                 f = sdsdup(field);
+#endif
             }
             if (flags & HASH_SET_TAKE_VALUE) {
                 v = value;
                 value = NULL;
             } else {
+#ifdef USE_NVM
+                v = sdsdupnvm(value);
+#else
                 v = sdsdup(value);
+#endif
+#ifdef SUPPORT_PBA
+                setArgPBA(v);
+#endif
             }
             dictAdd(o->ptr,f,v);
         }
@@ -448,6 +509,23 @@ sds hashTypeCurrentObjectNewSds(hashTypeIterator *hi, int what) {
     return sdsfromlonglong(vll);
 }
 
+#ifdef USE_NVM
+sds hashTypeCurrentObjectNewSdsNVM(hashTypeIterator *hi, int what) {
+    unsigned char *vstr;
+    unsigned int vlen;
+    long long vll;
+
+    hashTypeCurrentObject(hi,what,&vstr,&vlen,&vll);
+    if(vstr)
+    {
+        if(is_nvm_addr(vstr))
+            return (sds)vstr;
+        return sdsnewlen(vstr, vlen);
+    }
+    return sdsfromlonglong(vll);
+}
+#endif
+
 robj *hashTypeLookupWriteOrCreate(client *c, robj *key) {
     robj *o = lookupKeyWrite(c->db,key);
     if (o == NULL) {
@@ -464,7 +542,6 @@ robj *hashTypeLookupWriteOrCreate(client *c, robj *key) {
 
 void hashTypeConvertZiplist(robj *o, int enc) {
     serverAssert(o->encoding == OBJ_ENCODING_ZIPLIST);
-
     if (enc == OBJ_ENCODING_ZIPLIST) {
         /* Nothing to do... */
 
@@ -479,8 +556,13 @@ void hashTypeConvertZiplist(robj *o, int enc) {
         while (hashTypeNext(hi) != C_ERR) {
             sds key, value;
 
+#ifdef USE_NVM
+            key = hashTypeCurrentObjectNewSdsNVM(hi,OBJ_HASH_KEY);
+            value = hashTypeCurrentObjectNewSdsNVM(hi,OBJ_HASH_VALUE);
+#else
             key = hashTypeCurrentObjectNewSds(hi,OBJ_HASH_KEY);
             value = hashTypeCurrentObjectNewSds(hi,OBJ_HASH_VALUE);
+#endif
             ret = dictAdd(dict, key, value);
             if (ret != DICT_OK) {
                 serverLogHexDump(LL_WARNING,"ziplist with dup elements dump",
@@ -489,6 +571,7 @@ void hashTypeConvertZiplist(robj *o, int enc) {
             }
         }
         hashTypeReleaseIterator(hi);
+        // needn't to ziplistFree(), because all the NVM sds pointer has been added to dict
         zfree(o->ptr);
         o->encoding = OBJ_ENCODING_HT;
         o->ptr = dict;
@@ -519,6 +602,9 @@ void hsetnxCommand(client *c) {
     if (hashTypeExists(o, c->argv[2]->ptr)) {
         addReply(c, shared.czero);
     } else {
+#ifdef SUPPORT_PBA
+        server.pba.arg = c->argv[3];
+#endif
         hashTypeSet(o,c->argv[2]->ptr,c->argv[3]->ptr,HASH_SET_COPY);
         addReply(c, shared.cone);
         signalModifiedKey(c->db,c->argv[1]);
@@ -539,8 +625,12 @@ void hsetCommand(client *c) {
     if ((o = hashTypeLookupWriteOrCreate(c,c->argv[1])) == NULL) return;
     hashTypeTryConversion(o,c->argv,2,c->argc-1);
 
-    for (i = 2; i < c->argc; i += 2)
+    for (i = 2; i < c->argc; i += 2) {
+#ifdef SUPPORT_PBA
+        server.pba.arg = c->argv[i + 1];
+#endif
         created += !hashTypeSet(o,c->argv[i]->ptr,c->argv[i+1]->ptr,HASH_SET_COPY);
+    }
 
     /* HMSET (deprecated) and HSET return value is different. */
     char *cmdname = c->argv[0]->ptr;

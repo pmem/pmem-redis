@@ -1,4 +1,5 @@
 /*
+ * Copyright (c) 2018, Intel Corporation
  * Copyright (c) 2009-2012, Pieter Noordhuis <pcnoordhuis at gmail dot com>
  * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
  * All rights reserved.
@@ -49,6 +50,12 @@ unsigned char *ziplistFind(unsigned char *p, unsigned char *vstr, unsigned int v
 unsigned int ziplistLen(unsigned char *zl);
 size_t ziplistBlobLen(unsigned char *zl);
 void ziplistRepr(unsigned char *zl);
+
+#ifdef USE_NVM
+unsigned char* ziplistNVMEntryDecode(unsigned char* zl);
+void ziplistFree(unsigned char* zl);
+unsigned char *ziplistDeleteRangeNoFreeNVM(unsigned char *zl, int index, unsigned int num);
+#endif
 
 #ifdef REDIS_TEST
 int ziplistTest(int argc, char *argv[]);
