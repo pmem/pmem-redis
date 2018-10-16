@@ -48,7 +48,7 @@ void listTypePush(robj *subject, robj *value, int where) {
         size_t len = sdslen(value->ptr);
         sds ele = value->ptr;
 #ifdef USE_NVM
-        if(server.nvm_base && len > server.sdsmv_threshold)
+        if(server.nvm_base && len >= server.sdsmv_threshold)
         {
             sds e = sdsdupnvm(ele);
             if(!is_nvm_addr(e))
@@ -161,7 +161,7 @@ void listTypeInsert(listTypeEntry *entry, robj *value, int where) {
         sds str = value->ptr;
         size_t len = sdslen(str);
 #ifdef USE_NVM
-        if(server.nvm_base && len > server.sdsmv_threshold)
+        if(server.nvm_base && len >= server.sdsmv_threshold)
         {
             sds e = sdsdupnvm(str);
             if(!is_nvm_addr(e))
@@ -396,7 +396,7 @@ void lsetCommand(client *c) {
 #ifdef USE_NVM
         sds str = value->ptr;
         size_t len = sdslen(str);
-        if(server.nvm_base && len > server.sdsmv_threshold)
+        if(server.nvm_base && len >= server.sdsmv_threshold)
         {
             sds e = sdsdupnvm(str);
             if(!is_nvm_addr(e))

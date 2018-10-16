@@ -224,7 +224,7 @@ int hashTypeSet(robj *o, sds field, sds value, int flags) {
                 /*only update the value and only duplicate the value to NVM*/
                 sds ele = value;
 #ifdef USE_NVM
-                if(sdslen(ele)> server.sdsmv_threshold)
+                if(sdslen(ele)>= server.sdsmv_threshold)
                 {
                     sds e = sdsdupnvm(ele);
                     if(!is_nvm_addr(e))
@@ -247,7 +247,7 @@ int hashTypeSet(robj *o, sds field, sds value, int flags) {
            sds vele = value;
            sds fele = field;
 #ifdef USE_NVM
-            if(sdslen(vele)> server.sdsmv_threshold)
+            if(sdslen(vele)>= server.sdsmv_threshold)
             {
                 sds e = sdsdupnvm(vele);
                 if(!is_nvm_addr(e))
@@ -256,7 +256,7 @@ int hashTypeSet(robj *o, sds field, sds value, int flags) {
                     vele = e;
             }
 
-            if(sdslen(fele)> server.sdsmv_threshold)
+            if(sdslen(fele)>= server.sdsmv_threshold)
             {
                 sds e = sdsdupnvm(fele);
                 if(!is_nvm_addr(e))
