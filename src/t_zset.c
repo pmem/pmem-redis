@@ -1225,7 +1225,6 @@ void zsetConvert(robj *zobj, int encoding) {
             else {
                 ele = sdsnewlen((char*)vstr,vlen);
             }
-
             node = zslInsert(zs->zsl,score,ele);
             serverAssert(dictAdd(zs->dict,ele,&node->score) == DICT_OK);
             zzlNext(zl,&eptr,&sptr);
@@ -1393,7 +1392,7 @@ int zsetAdd(robj *zobj, double score, sds ele, int *flags, double *newscore) {
             /*only update the value and only duplicate the value to NVM*/
              sds zele = ele;
  #ifdef USE_NVM
-             if(sdslen(zele)> server.sdsmv_threshold)
+             if(sdslen(zele)>= server.sdsmv_threshold)
              {
                  sds e = sdsdupnvm(zele);
                  if(!is_nvm_addr(e))

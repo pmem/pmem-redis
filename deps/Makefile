@@ -77,6 +77,7 @@ lua: .make-prerequisites
 .PHONY: lua
 
 pmdk: .make-prerequisites
+	./update-pmdk.sh
 	@printf '%b %b\n' $(MAKECOLOR)MAKE$(ENDCOLOR) $(BINCOLOR)$@$(ENDCOLOR)
 	cd pmdk && $(MAKE)
 
