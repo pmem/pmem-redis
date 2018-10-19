@@ -33,6 +33,18 @@ Basically Pmem-Redis covers many aspects that related to DCPMM usage:
 * Pointer-based redis AOF
 * Persistent ring buffer
 
+# Get code
+
+1. clone the code:
+```
+git clone https://github.com/pmem/pmem-redis
+```
+2. PMDK is one submodule of this repo, so you have to init this submodule in order to get code
+```
+git submodule init
+git submodule update
+```
+
 # Building Pmem-Redis
 ## Compile Options
  Switches | Value | Descriptions
