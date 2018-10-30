@@ -748,9 +748,9 @@ start_server {
          waitForBgsave r
          r flushdb
 
-         for {set i 0} {$i < 1000} {incr i} {
+         for {set i 0} {$i < 1000000} {incr i} {
             set set_key nvm_set_$i
-            r set nvm_set_$i xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx_$i            
+            r set nvm_set_$i xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx_$i            
          }
 
          set f [r info Memory]

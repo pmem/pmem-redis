@@ -77,6 +77,8 @@ typedef long long mstime_t; /* millisecond time type. */
 
 #ifdef USE_NVM
 #include <memkind.h>
+
+#define IS_EMBED_IN_ZIPLIST(p, zl) ((char*)(zl) < (char*)(p) && (char*)(p) < (char*)(zl) + ziplistBlobLen(zl))
 #endif
 
 #ifdef AEP_COW
@@ -93,7 +95,6 @@ typedef long long mstime_t; /* millisecond time type. */
 #define FREE_LIST_DELAY_MS      1000
 
 #define IS_PBA() (server.aof_state == AOF_ON && server.pba.enable)
-#define IS_EMBED_IN_ZIPLIST(p, zl) ((char*)(zl) < (char*)(p) && (char*)(p) < (char*)(zl) + ziplistBlobLen(zl))
 #endif
 
 #ifdef USE_AOFGUARD

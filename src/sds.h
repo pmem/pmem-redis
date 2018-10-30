@@ -63,12 +63,18 @@ struct __attribute__ ((__packed__)) sdshdr16 {
 struct __attribute__ ((__packed__)) sdshdr32 {
     uint32_t len; /* used */
     uint32_t alloc; /* excluding the header and null terminator */
+#ifdef FAST_SDSFREE
+    unsigned char __padding;
+#endif
     unsigned char flags; /* 3 lsb of type, 5 unused bits */
     char buf[];
 };
 struct __attribute__ ((__packed__)) sdshdr64 {
     uint64_t len; /* used */
     uint64_t alloc; /* excluding the header and null terminator */
+#ifdef FAST_SDSFREE
+    unsigned char __padding[3];
+#endif
     unsigned char flags; /* 3 lsb of type, 5 unused bits */
     char buf[];
 };

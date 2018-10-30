@@ -1332,7 +1332,6 @@ robj *rdbLoadObject(int rdbtype, rio *rdb) {
                 == NULL) return NULL;
             if ((value = rdbGenericLoadStringObject(rdb,RDB_LOAD_SDS,NULL))
                 == NULL) return NULL;
-
             /* Add pair to ziplist */
             o->ptr = ziplistPush(o->ptr, (unsigned char*)field,
                     sdslen(field), ZIPLIST_TAIL);
@@ -1343,13 +1342,27 @@ robj *rdbLoadObject(int rdbtype, rio *rdb) {
             if (sdslen(field) > server.hash_max_ziplist_value ||
                 sdslen(value) > server.hash_max_ziplist_value)
             {
+#ifdef USE_NVM
+                if(!is_nvm_addr(field))
+                    sdsfree(field);
+                if(!is_nvm_addr(value))
+                    sdsfree(value);
+#else
                 sdsfree(field);
                 sdsfree(value);
+#endif
                 hashTypeConvert(o, OBJ_ENCODING_HT);
                 break;
             }
+#ifdef USE_NVM
+            if(!is_nvm_addr(field))
+                sdsfree(field);
+            if(!is_nvm_addr(value))
+                sdsfree(value);
+#else
             sdsfree(field);
             sdsfree(value);
+#endif
         }
 
         /* Load remaining fields and values into the hash table */
@@ -1360,7 +1373,6 @@ robj *rdbLoadObject(int rdbtype, rio *rdb) {
                 == NULL) return NULL;
             if ((value = rdbGenericLoadStringObject(rdb,RDB_LOAD_SDS,NULL))
                 == NULL) return NULL;
-
             /* Add pair to hash table */
             ret = dictAdd((dict*)o->ptr, field, value);
             if (ret == DICT_ERR) {
