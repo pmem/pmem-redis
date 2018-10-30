@@ -1219,7 +1219,7 @@ void zsetConvert(robj *zobj, int encoding) {
             if (vstr == NULL)
                 ele = sdsfromlonglong(vlong);
 #ifdef USE_NVM
-            else if(is_nvm_addr(vstr)&& !IS_EMBED_IN_ZIPLIST(vstr,zl))
+            else if(is_nvm_addr(vstr) && !IS_EMBED_IN_ZIPLIST(vstr,zl))
                 ele = (sds)vstr;
 #endif
             else {

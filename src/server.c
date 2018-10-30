@@ -1546,6 +1546,27 @@ void initServerConfig(void) {
     server.bug_report_start = 0;
     server.watchdog_period = 0;
 
+#ifdef USE_NVM
+    server.nvm_dir = NULL;
+    server.nvm_base = NULL;
+    server.nvm_size = 0;
+    server.pmem_kind = NULL;
+    server.sdsmv_threshold = 0;
+#endif
+
+#ifdef FAST_SDSFREE
+    serverAssert(sizeof(struct sdshdr5) == 1);
+    serverAssert((size_t)(&(((struct sdshdr5*)0)->flags)) == 0);
+    serverAssert(sizeof(struct sdshdr8) == 3);
+    serverAssert((size_t)(&(((struct sdshdr8*)0)->flags)) == 2);
+    serverAssert(sizeof(struct sdshdr16) == 5);
+    serverAssert((size_t)(&(((struct sdshdr16*)0)->flags)) == 4);
+    serverAssert(sizeof(struct sdshdr32) == 10);
+    serverAssert((size_t)(&(((struct sdshdr32*)0)->flags)) == 9);
+    serverAssert(sizeof(struct sdshdr64) == 20);
+    serverAssert((size_t)(&(((struct sdshdr64*)0)->flags)) == 19);
+#endif
+
 #ifdef SUPPORT_PBA
     server.pba.enable = 0;
     server.pba.loading = 0;

@@ -780,6 +780,18 @@ void loadServerConfigFromString(char *config) {
         }
 #endif
 
+#ifdef USE_AOFGUARD
+        else if(strcasecmp(argv[0], "aof-write-turbo") == 0)
+        {
+            if(argc != 2)
+            {
+                err = "--aof-write-turbo <yes or no>";
+                goto loaderr;
+            }
+            server.aofguard.enable = strcasecmp(argv[1], "yes") == 0;
+        }
+#endif
+
          else {
             err = "Bad directive or wrong number of arguments"; goto loaderr;
         }
@@ -795,10 +807,19 @@ void loadServerConfigFromString(char *config) {
     }
     sdsfreesplitres(lines,totlines);
 
-#ifdef USE_AOFGUARD
+#if defined(USE_AOFGUARD) && defined(SUPPORT_PBA)
     if(server.nvm_dir && server.aof_state == AOF_ON && server.pba.enable)
-    {
         server.aofguard.enable = 1;
+#endif
+
+#ifdef USE_AOFGUARD
+    if(server.aofguard.enable)
+    {
+        if(!server.nvm_dir)
+        {
+            serverLog(LL_WARNING, "aof write turbo need param <nvm-dir>!");
+            exit(1);
+        }
         if((server.aofguard.nvm_dir_fd = open(server.nvm_dir, O_DIRECTORY)) < 0)
         {
             serverLog(LL_WARNING, "open('%s', O_DIRECTORY) failed!", server.nvm_dir);
@@ -807,7 +828,7 @@ void loadServerConfigFromString(char *config) {
         char filename[128];
         sprintf(filename, "redis-%d.ag", server.port);
         server.aofguard.nvm_file_name = zstrdup(filename);
-        server.aof_fsync = AOF_FSYNC_EVERYSEC; 
+        server.aof_fsync = AOF_FSYNC_EVERYSEC;
     }
 #endif
 

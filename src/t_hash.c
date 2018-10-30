@@ -510,7 +510,11 @@ sds hashTypeCurrentObjectNewSds(hashTypeIterator *hi, int what) {
 }
 
 #ifdef USE_NVM
-sds hashTypeCurrentObjectNewSdsNVM(hashTypeIterator *hi, int what) {
+static sds hashTypeCurrentObjectNewSdsNVM(hashTypeIterator *hi, int what) {
+    robj* o = hi->subject;
+    serverAssert(o->encoding == OBJ_ENCODING_ZIPLIST);
+    unsigned char* zl = o->ptr;
+
     unsigned char *vstr;
     unsigned int vlen;
     long long vll;
@@ -518,7 +522,7 @@ sds hashTypeCurrentObjectNewSdsNVM(hashTypeIterator *hi, int what) {
     hashTypeCurrentObject(hi,what,&vstr,&vlen,&vll);
     if(vstr)
     {
-        if(is_nvm_addr(vstr))
+        if(is_nvm_addr(vstr) && !IS_EMBED_IN_ZIPLIST(vstr, zl))
             return (sds)vstr;
         return sdsnewlen(vstr, vlen);
     }

@@ -17,7 +17,7 @@ start_server {
 
         array set nvmhash_save {}
         for {set i 0} {$i < 1000} {incr i} {
-            for {set j 0} {$j < 4} {incr j} {
+            for {set j 0} {$j < 1000} {incr j} {
               r hset nvmhash_save_$i field_$j  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx_$i
            }
         }

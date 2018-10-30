@@ -32,7 +32,7 @@ start_server {
           r flushdb
 
           for {set i 0} {$i < 1000} {incr i} {
-            for {set j 1} {$j < 4} {incr j} {
+            for {set j 1} {$j < 1000} {incr j} {
                   r zadd nvm_zset_$i $j xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx_$i
             }        
           }
@@ -43,12 +43,6 @@ start_server {
 
           r bgsave
 
-          for {set i 0} {$i < 200} {incr i} {
-            for {set j 1} {$j < 4} {incr j} {
-                  r zadd nvm_zset_$i $j yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy_$i
-             }
-          }
-          
           for {set i 0} {$i < 200} {incr i} {
               r del nvm_zset_$i
           }

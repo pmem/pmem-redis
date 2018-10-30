@@ -160,6 +160,9 @@ sds sdsnewlennvm(const void *init, size_t initlen) {
 
     sh = s_malloc_nvm(hdrlen+initlen+1);
     if (sh == NULL) return NULL;
+#ifdef FAST_SDSFREE
+    serverAssert(((size_t)sh & 7) == 0);
+#endif
     if (!init)
         memset(sh, 0, hdrlen+initlen+1);
     s = (char*)sh+hdrlen;
@@ -296,6 +299,10 @@ sds sdsdup(const sds s) {
     return sdsnewlen(s, sdslen(s));
 }
 
+#ifdef FAST_SDSFREE
+static int header_size_array[] = {0, 1, 10, 3, 20, 5, 0, 0};
+#endif
+
 /* Free an sds string. No operation is performed if 's' is NULL. */
 void sdsfree(sds s) {
     if (s == NULL) return;
@@ -320,6 +327,17 @@ void sdsfree(sds s) {
         return;
     }
 #endif
+
+#ifdef FAST_SDSFREE
+    if(is_nvm_addr(s))
+    {
+        int header_size = header_size_array[(size_t)s & 7];
+        serverAssert(header_size);
+        s_free((char*)s - header_size);
+        return;
+    }
+#endif
+
     s_free((char*)s-sdsHdrSize(s[-1]));
 }
 

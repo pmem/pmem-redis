@@ -21,7 +21,7 @@ NODEPS:=clean distclean
 
 # Default settings
 STD=-std=gnu99 -pedantic -DREDIS_STATIC=''
-WARN=-Wall -W -Wno-missing-field-initializers
+WARN=-Wall -W -Wno-missing-field-initializers -Wno-implicit-fallthrough -Wno-expansion-to-defined -Wno-maybe-uninitialized
 OPT=$(OPTIMIZATION)
 
 PREFIX?=/usr/local
@@ -135,6 +135,7 @@ ifeq ($(USE_NVM),yes)
 	AEP_COW = yes
 	SUPPORT_PBA = yes
 	USE_AOFGUARD = yes
+	FAST_SDSFREE = yes
 endif
 
 ifeq ($(AEP_COW),yes)
@@ -151,6 +152,10 @@ ifeq ($(USE_AOFGUARD), yes)
 	DEPENDENCY_TARGETS += aofguard
 	FINAL_CFLAGS += -DUSE_AOFGUARD -I../deps/aofguard/include
 	FINAL_LIBS += ../deps/aofguard/lib/libaofguard.a
+endif
+
+ifeq ($(FAST_SDSFREE), yes)
+	FINAL_CFLAGS += -DFAST_SDSFREE
 endif
 
 REDIS_CC=$(QUIET_CC)$(CC) $(FINAL_CFLAGS)
