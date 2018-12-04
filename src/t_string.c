@@ -511,8 +511,11 @@ void appendCommand(client *c) {
         if (checkType(c,o,OBJ_STRING))
             return;
 
-#ifdef AEP_COW 
-        o->ptr=redisduplicatenvmaddr(o->ptr);
+#ifdef AEP_COW
+        size_t header_size = sdsheadersize(o->ptr);
+        char * ptr =(char *)o->ptr-header_size;
+        ptr=redisduplicatenvmaddr(ptr);
+        o->ptr=ptr+header_size;
 #endif
         /* append is an argument, so always an sds */
         append = c->argv[2];

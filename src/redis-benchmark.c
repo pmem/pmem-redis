@@ -786,6 +786,12 @@ int main(int argc, const char **argv) {
             benchmark("SET",cmd,len);
             free(cmd);
         }
+        
+        if (test_is_selected("append")) {
+            len = redisFormatCommand(&cmd,"APPEND key:__rand_int__ %s",data);
+            benchmark("APPEND",cmd,len);
+            free(cmd);
+        }
 
         if(test_is_selected("set_bigkey"))
         {
