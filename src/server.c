@@ -1885,7 +1885,8 @@ void * redisduplicatenvmaddr(void *addr) {
             memcpy(dupaddr,addr, size);
             server.cow_mem_size +=size;
         }else {
-            pmem_memcpy_persist(dupaddr, addr, size);
+            //pmem_memcpy_persist(dupaddr, addr, size);
+            pmem_memcpy(dupaddr, addr, size,PMEM_F_MEM_NOFLUSH);
             cow_addaddressindict(server.forked_dict, dupaddr);
             server.cow_nvm_size +=size;
         }

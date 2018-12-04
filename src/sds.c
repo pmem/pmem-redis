@@ -579,11 +579,24 @@ sds sdscatlen(sds s, const void *t, size_t len) {
 
     s = sdsMakeRoomFor(s,len);
     if (s == NULL) return NULL;
-    s_memcpy(s+curlen, t, len);
     sdssetlen(s, curlen+len);
     s[curlen+len] = '\0';
+    s_memcpy(s+curlen, t, len);
     return s;
 }
+
+sds sdscatlen_total(sds s, const void *t, size_t len,size_t * total) {
+    size_t curlen = sdslen(s);
+
+    s = sdsMakeRoomFor(s,len);
+    if (s == NULL) return NULL;
+    sdssetlen(s, curlen+len);
+    s[curlen+len] = '\0';
+    s_memcpy(s+curlen, t, len);
+    *total=curlen+len;
+    return s;
+}
+
 
 /* Append the specified null termianted C string to the sds string 's'.
  *

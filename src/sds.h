@@ -237,6 +237,7 @@ sds sdsdup(const sds s);
 void sdsfree(sds s);
 sds sdsgrowzero(sds s, size_t len);
 sds sdscatlen(sds s, const void *t, size_t len);
+sds sdscatlen_total(sds s, const void *t, size_t len,size_t *total);
 sds sdscat(sds s, const char *t);
 sds sdscatsds(sds s, const sds t);
 sds sdscpylen(sds s, const char *t, size_t len);
