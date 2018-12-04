@@ -512,10 +512,12 @@ void appendCommand(client *c) {
             return;
 
 #ifdef AEP_COW
-        size_t header_size = sdsheadersize(o->ptr);
-        char * ptr =(char *)o->ptr-header_size;
-        ptr=redisduplicatenvmaddr(ptr);
-        o->ptr=ptr+header_size;
+        if (o->encoding == OBJ_ENCODING_RAW) {
+            size_t header_size = sdsheadersize(o->ptr);
+            char * ptr =(char *)o->ptr-header_size;
+            o->ptr=redisduplicatenvmaddr(o->ptr);
+            o->ptr=ptr+header_size;
+        } // if o->encoding is int, it will use the default cow. 
 #endif
         /* append is an argument, so always an sds */
         append = c->argv[2];
@@ -532,6 +534,7 @@ void appendCommand(client *c) {
 #endif
         o->ptr = sdscatlen(o->ptr,append->ptr,sdslen(append->ptr));
         totlen = sdslen(o->ptr);
+        // the above two lines can be optimized, it is the write->flush->read mode
 #ifdef USE_NVM
         if(o->encoding == OBJ_ENCODING_RAW && !is_nvm_addr(o->ptr)) {
             o->ptr = sdsmvtonvm(o->ptr);
