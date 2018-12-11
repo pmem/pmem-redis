@@ -48,8 +48,8 @@ do
     core_config=$((${LOCAL_THREAD}+${instances}-1)),$((${REMOTE_THREAD} + ${instances}-1))
 
     echo -e "\e[33mstarting redis server $instances\e[0m"
-    echo -e "\e[33mnumactl -m ${BIND_SOCKET} taskset -c $core_config  $REDIS_PATH/redis-server --appendonly no --bind ${MASTER_HOST} --port ${port} --nvm-maxcapacity 15 --nvm-dir /mnt/pmem4/ --nvm-threshold 64\e[0m"
-    numactl -m ${BIND_SOCKET} taskset -c $core_config  $REDIS_PATH/src/redis-server --appendonly no --bind ${MASTER_HOST} --port ${port} --nvm-maxcapacity 15 --nvm-dir /mnt/pmem4/ --nvm-threshold 64 &
+    echo -e "\e[33mnumactl -m ${BIND_SOCKET} taskset -c $core_config  $REDIS_PATH/redis-server --appendonly no --bind ${MASTER_HOST} --port ${port} --nvm-maxcapacity 15 --nvm-dir /mnt/pmem0/ --nvm-threshold 64\e[0m"
+    numactl -m ${BIND_SOCKET} taskset -c $core_config  $REDIS_PATH/src/redis-server --appendonly no --bind ${MASTER_HOST} --port ${port} --nvm-maxcapacity 15 --nvm-dir /mnt/pmem0/ --nvm-threshold 64 &
 
 done
 #--------------------------start slave replication servers------------------------------------------------------
@@ -59,7 +59,7 @@ do
     core_config=$((${SLAVE_LOCAL_THREAD}+${instances}-1)),$((${SLAVE_REMOTE_THREAD} + ${instances}-1))
 
     echo -e "\e[33mstarting redis server $instances\e[0m"
-    echo -e "\e[33mnumactl -m ${BIND_SOCKET} taskset -c $core_config  $REDIS_PATH/redis-server --appendonly no --bind {SLAVE_HOST} --port ${port} --nvm-maxcapacity 15 --nvm-dir /mnt/pmem8/ --nvm-threshold 64 --slaveof ${MASTER_HOST} ${port}\e[0m"
-    ssh $SLAVE_HOST numactl -m ${BIND_SOCKET} taskset -c $core_config  $REDIS_PATH/src/redis-server --appendonly no --bind ${SLAVE_HOST} --port ${port} --nvm-maxcapacity 15 --nvm-dir /mnt/pmem8/ --nvm-threshold 64 --slaveof ${MASTER_HOST} ${port} &
+    echo -e "\e[33mnumactl -m ${BIND_SOCKET} taskset -c $core_config  $REDIS_PATH/redis-server --appendonly no --bind {SLAVE_HOST} --port ${port} --nvm-maxcapacity 15 --nvm-dir /mnt/pmem1/ --nvm-threshold 64 --slaveof ${MASTER_HOST} ${port}\e[0m"
+    ssh $SLAVE_HOST numactl -m ${BIND_SOCKET} taskset -c $core_config  $REDIS_PATH/src/redis-server --appendonly no --bind ${SLAVE_HOST} --port ${port} --nvm-maxcapacity 15 --nvm-dir /mnt/pmem1/ --nvm-threshold 64 --slaveof ${MASTER_HOST} ${port} &
 
 done

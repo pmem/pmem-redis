@@ -2,7 +2,7 @@ start_server {
    tags {"hash"}
    overrides {
         "nvm-maxcapacity" 10
-        "nvm-dir" "/mnt/pmem4/"
+        "nvm-dir" "/mnt/pmem0/"
         "nvm-threshold" 64
         "list-max-ziplist-size" 5
         "maxmemory" 1073741824

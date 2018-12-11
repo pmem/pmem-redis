@@ -3,8 +3,9 @@
 pkill redis-server
 export REDIS_PATH=/root/redis-4.0.0-volatile/
 export LD_LIBRARY_PATH=${REDIS_PATH}/deps/memkind/.libs/:${REDIS_PATH}/deps/pmdk/src/nondebug/
-export REDIS_NUM=28
+export REDIS_NUM=$1
 export BIND_SOCKET=0
+export NVM_THRESHOLD=$2
 # export Zset_max_ziplist_entries=(512 2000 512)
 # export Zset_max_ziplist_value=(64 2000 2000)
 export Zset_max_ziplist_entries=512
@@ -52,7 +53,7 @@ do
     core_config=$((${LOCAL_THREAD}+${instances}-1)),$((${REMOTE_THREAD} + ${instances}-1))
 
     echo -e "\e[33mstarting redis server $instances\e[0m"
-    echo -e "\e[33mnumactl -m ${BIND_SOCKET} taskset -c $core_config  $REDIS_PATH/redis-server --appendonly no --port ${port} --nvm-maxcapacity 15 --nvm-dir /mnt/pmem{$BIND_SOCKET}/ --nvm-threshold 64 --zset-max-ziplist-entries $Zset_max_ziplist_entries --zset-max-ziplist-value $Zset_max_ziplist_value\e[0m"
-    numactl -m ${BIND_SOCKET} taskset -c $core_config  $REDIS_PATH/src/redis-server --appendonly no --port ${port} --nvm-maxcapacity 15 --nvm-dir /mnt/pmem${BIND_SOCKET}/ --nvm-threshold 64 --zset-max-ziplist-entries $Zset_max_ziplist_entries --zset-max-ziplist-value $Zset_max_ziplist_value &
+    echo -e "\e[33mnumactl -m ${BIND_SOCKET} taskset -c $core_config  $REDIS_PATH/src/redis-server --appendonly no --port ${port} --nvm-maxcapacity 15 --nvm-dir /mnt/pmem${BIND_SOCKET}/ --nvm-threshold $NVM_THRESHOLD --dbfilename ${port}.dump --zset-max-ziplist-entries $Zset_max_ziplist_entries --zset-max-ziplist-value $Zset_max_ziplist_value\e[0m"
+    numactl -m ${BIND_SOCKET} taskset -c $core_config  $REDIS_PATH/src/redis-server --appendonly no --port ${port} --nvm-maxcapacity 15 --nvm-dir /mnt/pmem${BIND_SOCKET}/ --nvm-threshold $NVM_THRESHOLD --dbfilename ${port}.dump --zset-max-ziplist-entries $Zset_max_ziplist_entries --zset-max-ziplist-value $Zset_max_ziplist_value &
 
 done

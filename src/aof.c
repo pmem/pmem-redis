@@ -821,7 +821,8 @@ robj* resolvePBAString(robj* o)
         decrRefCount(o);
         o = createObject(OBJ_STRING, s);
     }
-    addSdsToMoveListPBA((void*)(&(o->ptr)));
+    if(o->encoding == OBJ_ENCODING_RAW)
+        addSdsToMoveListPBA((void*)(&(o->ptr)));
     return o;
 }
 
@@ -1001,7 +1002,7 @@ size_t jemallocat_memkind_standardize_size(void* udata, size_t size)
 int jemallocat_memkind_is_page_allocatable(void* udata, size_t index)
 {
     UNUSED(udata);
-    if(index % 512 < 13)
+    if(index % 512 < 12)
         return 0;
     return 1;
 }

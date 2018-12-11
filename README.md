@@ -106,27 +106,27 @@ Create namespace:
 
     ndctl create-namespace -m fsdax -r <regionid>
     
-Then you may see `/dev/pmem<id>` under `/dev` folder, for example, we have `/dev/pmem4` in our machine.
+Then you may see `/dev/pmem<id>` under `/dev` folder, for example, we have `/dev/pmem0` in our machine.
 
 Format the pmem device:
 
-    mkfs.ext4 /dev/pmem4
+    mkfs.ext4 /dev/pmem0
     
 Mount as dax:
     
-    mkdir /mnt/pmem4
-    mount -o dax /dev/pmem4 /mnt/pmem4
+    mkdir /mnt/pmem0
+    mount -o dax /dev/pmem0 /mnt/pmem0
     
 ## Run pmem-redis:
 
-    src/redis-server --nvm-maxcapacity 1 --nvm-dir /mnt/pmem4 --nvm-threshold 64
+    src/redis-server --nvm-maxcapacity 1 --nvm-dir /mnt/pmem0 --nvm-threshold 64
 
-This command starts a redis server that uses DCPMM device(/mnt/pmem4) with max capacity 1GB, and it moves the values whose length are greater than 64 into DCPMM.
+This command starts a redis server that uses DCPMM device(/mnt/pmem0) with max capacity 1GB, and it moves the values whose length are greater than 64 into DCPMM.
  
 # Hints 
-1. In our Unit Test, we default read `/mnt/pmem4` as pmem device and run test, please modify your pmem device folder to `/mnt/pmem4` to meet the requirement.
+1. In our Unit Test, we default read `/mnt/pmem0` as pmem device and run test, please modify your pmem device folder to `/mnt/pmem0` to meet the requirement.
 
-2. If you enable --pointer-based-aof in redis server, than pmem-redis will generate one `.ag` file under `/mnt/pmem4` device which link to the AOF file generated on disk. If you need to delete the AOF file, please make sure to delete the `.ag` file at the same time to avoid AOF load error.
+2. If you enable --pointer-based-aof in redis server, than pmem-redis will generate one `.ag` file under `/mnt/pmem0` device which link to the AOF file generated on disk. If you need to delete the AOF file, please make sure to delete the `.ag` file at the same time to avoid AOF load error.
 
 # Code contributions
 

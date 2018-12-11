@@ -63,7 +63,7 @@ size_class() {
     rem="yes"
   fi
 
-  if [ ${lg_size} -lt $((${lg_p} + ${lg_g} + 4)) ] ; then #size < 256K, jianshiz
+  if [ ${lg_size} -lt $((${lg_p} + ${lg_g})) ] ; then
     bin="yes"
   else
     bin="no"

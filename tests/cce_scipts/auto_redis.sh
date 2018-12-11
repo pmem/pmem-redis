@@ -2,8 +2,8 @@
 config_number=$1
 ## WA to fix the issue that the enp129s0f0 can't config
 ifconfig enp175s0f0 192.168.14.100
-aep_s0="/mnt/pmem8/"
-aep_s1="/mnt/pmem9/"
+aep_s0="/mnt/pmem0/"
+aep_s1="/mnt/pmem1/"
 ser_ip=192.168.17.1
 ser_s0=192.168.16.1
 ser_s1=192.168.14.1

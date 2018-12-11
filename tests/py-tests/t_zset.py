@@ -6,7 +6,7 @@ print('============starting redis-server==================')
 
 port = 1228
 os.system('kill -9 $(ps -ax | grep "redis-server \*:%s" | awk \'{print $1}\')' % port)
-os.system('../../src/redis-server --nvm-maxcapacity 1 --nvm-dir /mnt/pmem4 --nvm-threshold 64' \
+os.system('../../src/redis-server --nvm-maxcapacity 1 --nvm-dir /mnt/pmem0 --nvm-threshold 64' \
           ' --zset-max-ziplist-entries 3 --zset-max-ziplist-value 128 --port %s &' % port)
 time.sleep(2)
 

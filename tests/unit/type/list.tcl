@@ -3,7 +3,7 @@ start_server {
     overrides {
         "list-max-ziplist-size" 5
         "nvm-maxcapacity" 12
-        "nvm-dir" "/mnt/pmem4"
+        "nvm-dir" "/mnt/pmem0"
     }
 } {
     source "tests/unit/type/list-common.tcl"

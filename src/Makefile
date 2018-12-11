@@ -121,8 +121,8 @@ endif
 
 ifeq ($(MALLOC),jemalloc)
 	DEPENDENCY_TARGETS+= jemalloc
-	FINAL_CFLAGS+= -DUSE_JEMALLOC -I../deps/jemalloc_JE/include
-	FINAL_LIBS+= ../deps/jemalloc_JE/lib/libjemalloc.a
+	FINAL_CFLAGS+= -DUSE_JEMALLOC -I../deps/jemalloc/include
+	FINAL_LIBS+= ../deps/jemalloc/lib/libjemalloc.a
 	FINAL_CFLAGS+= -DJE_PREFIX=je_
 endif
 
@@ -130,7 +130,7 @@ ifeq ($(USE_NVM),yes)
 	DEPENDENCY_TARGETS+= pmdk memkind
 	FINAL_CFLAGS+= -DUSE_NVM -I../deps/pmdk/src/include -I../deps/memkind/include
 	FINAL_LIBS+= ../deps/pmdk/src/nondebug/libpmem.a
-	FINAL_LIBS+= ../deps/jemalloc/obj/lib/libjemalloc.a ../deps/memkind/.libs/libmemkind.a
+	FINAL_LIBS+= ../deps/memkind/jemalloc/obj/lib/libjemalloc.a ../deps/memkind/.libs/libmemkind.a
 	FINAL_LIBS+= -lnuma
 	AEP_COW = yes
 	SUPPORT_PBA = yes

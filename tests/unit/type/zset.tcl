@@ -2,7 +2,7 @@ start_server {
    tags {"zset"}
    overrides {
         "nvm-maxcapacity" 10
-        "nvm-dir" "/mnt/pmem4/"
+        "nvm-dir" "/mnt/pmem0/"
         "nvm-threshold" 64
         "maxmemory" 1073741824
         "maxmemory-policy" "allkeys-lru"

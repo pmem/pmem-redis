@@ -3,7 +3,7 @@ start_server {
     overrides { 
         "set-max-intset-entries" 512
         "nvm-maxcapacity" 10
-        "nvm-dir" "/mnt/pmem4/"
+        "nvm-dir" "/mnt/pmem0/"
         "nvm-threshold" 64
     }
 } {

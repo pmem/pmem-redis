@@ -9,10 +9,10 @@ slaveport="9000"
 slaveredis="/root/lina/redis-4.0.0-volatile/src"
 
 nvm_maxcapacity=20
-master_nvm_dir="/mnt/pmem4"
+master_nvm_dir="/mnt/pmem0"
 nvm_threshold="64"
 
-slave_nvm_dir="/mnt/pmem8"
+slave_nvm_dir="/mnt/pmem0"
 
 ${masterredis}/redis-server --nvm-maxcapacity $nvm_maxcapacity --nvm-dir $master_nvm_dir --nvm-threshold $nvm_threshold --bind $masterhost --port $masterport &
 sleep 1
