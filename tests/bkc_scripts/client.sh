@@ -112,21 +112,21 @@ do
         sleep 5
     done
 
-       #--------------------------start testing------------------------------------------------------
-    for (( instances=1; instances <= $REDIS_NUM; instances++ ))
-    do
-        port=$((9000 + ${instances}))
-        core_config=$((${LOCAL_THREAD}+${instances}-1)),$((${REMOTE_THREAD} + ${instances}-1))
-        echo -e  "\e[33m$workload starting redis client $instances\e[0m"
-        echo -e "\e[33m[$workload]=>numactl -m ${BIND_SOCKET} taskset -c $core_config ${REDIS_PATH}/src/redis-benchmark -p ${port} -r ${KEY_RANGE} -n ${REQ_NUM} -d $DATA_SIZE -t ${workload} $Field_Range > ${REDIS_PATH}/log/${REDIS_NUM}_$instances.log  &\e[0m"
-        numactl -m ${BIND_SOCKET} taskset -c $core_config ${REDIS_PATH}/src/redis-benchmark -p ${port} -r ${KEY_RANGE} -n ${REQ_NUM} -d $DATA_SIZE -t ${workload} ${Field_Range} > ${REDIS_PATH}/log/${workload}/${REDIS_NUM}_$instances.log  &
-        ${REDIS_PATH}/src/redis-cli -p ${port} bgsave &
-    done
+    #--------------------------start bgsave testing------------------------------------------------------
+    #for (( instances=1; instances <= $REDIS_NUM; instances++ ))
+    #do
+    #    port=$((9000 + ${instances}))
+    #    core_config=$((${LOCAL_THREAD}+${instances}-1)),$((${REMOTE_THREAD} + ${instances}-1))
+    #    echo -e  "\e[33m$workload starting redis client $instances\e[0m"
+    #    echo -e "\e[33m[$workload]=>numactl -m ${BIND_SOCKET} taskset -c $core_config ${REDIS_PATH}/src/redis-benchmark -p ${port} -r ${KEY_RANGE} -n ${REQ_NUM} -d $DATA_SIZE -t ${workload} $Field_Range > ${REDIS_PATH}/log/${REDIS_NUM}_$instances.log  &\e[0m"
+    #    numactl -m ${BIND_SOCKET} taskset -c $core_config ${REDIS_PATH}/src/redis-benchmark -p ${port} -r ${KEY_RANGE} -n ${REQ_NUM} -d $DATA_SIZE -t ${workload} ${Field_Range} > ${REDIS_PATH}/log/${workload}/${REDIS_NUM}_$instances.log  &
+    #    ${REDIS_PATH}/src/redis-cli -p ${port} bgsave &
+    #done
     #--------------------------Waiting benchmark finish------------------------------------------------------
-    while [ $(ps -ef | grep -c redis-benchmark) -gt 1 ];do
-        echo -e "\e[33m Waiting $(($(ps -ef | grep -c redis-benchmark)-1)) benchmark finish \e[0m"
-        sleep 5
-    done
+    #while [ $(ps -ef | grep -c redis-benchmark) -gt 1 ];do
+    #    echo -e "\e[33m Waiting $(($(ps -ef | grep -c redis-benchmark)-1)) benchmark finish \e[0m"
+    #    sleep 5
+    #done
     #-------------------
 
     #--------------------------Collect the result------------------------------------------------------  
