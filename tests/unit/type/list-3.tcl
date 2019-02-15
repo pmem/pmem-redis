@@ -3,7 +3,7 @@ start_server {
     overrides {
         "list-max-ziplist-size" 16
         "nvm-maxcapacity" 2
-        "nvm-dir" "/mnt/pmem4"
+        "nvm-dir" "/mnt/pmem0"
     }
 } {
 

@@ -3,7 +3,7 @@ start_server {
     overrides {
             "nvm-threshold" 10
             "nvm-maxcapacity" 12
-            "nvm-dir" "/mnt/pmem4"
+            "nvm-dir" "/mnt/pmem0"
         }
 } {
     test {SET and GET an item} {
