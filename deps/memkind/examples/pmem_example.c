@@ -157,6 +157,15 @@ main(int argc, char *argv[])
     memkind_free(pmem_kind1, pmem_str10);
     memkind_free(pmem_kind1, pmem_str11);
     memkind_free(pmem_kind1, pmem_str12);
+    //dennis confirm the memkind can allocate memory after free. it have a bug on the jemalloc 4.0.3    
+    printf("recheck the memkind_malloc after free (jemalloc 4.0.3 can't really free the memory space)\n");
+    pmem_str12 = (char *)memkind_malloc(pmem_kind1, 16 * 1024 * 1024);
+    if (pmem_str12 == NULL) {
+        perror("memkind_malloc()");
+        fprintf(stderr, "Unable to allocate pmem string (pmem_str12)\n");
+        return errno ? -errno : 1;
+    }
+    printf("memkind_free issue has been solved since jemalloc 4.1.0\n");
 
     return 0;
 }
