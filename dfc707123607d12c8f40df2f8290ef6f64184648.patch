@@ -1,0 +1,431 @@
+diff --git a/deps/pmdk b/deps/pmdk
+--- a/deps/pmdk
++++ b/deps/pmdk
+@@ -1 +1 @@
+-Subproject commit ff92185579b4f5b9250ddcb75dc8ee5b820cc407
++Subproject commit ff92185579b4f5b9250ddcb75dc8ee5b820cc407-dirty
+diff --git a/src/Makefile b/src/Makefile
+index 5346d71..bb5a9dc 100644
+--- a/src/Makefile
++++ b/src/Makefile
+@@ -128,8 +128,8 @@ endif
+ 
+ ifeq ($(USE_NVM),yes)
+ 	DEPENDENCY_TARGETS+= pmdk memkind
+-	FINAL_CFLAGS+= -DUSE_NVM -I../deps/pmdk/src/include -I../deps/memkind/include
+-	FINAL_LIBS+= ../deps/pmdk/src/nondebug/libpmem.a
++	FINAL_CFLAGS+= -DUSE_NVM -I../deps/pmdk/src/include -I../deps/pmdk/src/include/libpmemobj  -I../deps/memkind/include -I../deps/pmdk/src/libpmemobj -I../deps/pmdk/src/common
++	FINAL_LIBS+= ../deps/pmdk/src/nondebug/libpmem.a ../deps/pmdk/src/nondebug/libpmemobj.so
+ 	FINAL_LIBS+= ../deps/memkind/jemalloc/obj/lib/libjemalloc.a ../deps/memkind/.libs/libmemkind.a
+ 	FINAL_LIBS+= -lnuma
+ 	AEP_COW = yes
+diff --git a/src/nvm.c b/src/nvm.c
+index 38edc50..0062cff 100644
+--- a/src/nvm.c
++++ b/src/nvm.c
+@@ -55,6 +55,15 @@
+ static size_t used_nvm = 0;
+ static size_t alloc_count = 0;
+ 
++PMEMoid reserve_wrapper(size_t size, uint64_t type_num) {
++	return pmemobj_reserve(server.pmem_kind, &server.cursor_action->actions[server.cursor_action->counter++], size, type_num);
++}
++
++
++void set_value_wrapper(uint64_t *ptr, uint64_t value) {
++	pmemobj_set_value(server.pmem_kind, &server.cursor_action->actions[server.cursor_action->counter++], ptr, value);
++}
++
+ int is_nvm_addr(const void* ptr) {
+     if(!server.nvm_base)
+         return 0;
+@@ -72,8 +81,18 @@ void* nvm_malloc(size_t size) {
+ #endif
+     void *ptr = NULL;
+     if(server.pmem_kind!=NULL) {
++
++#if 0
+         ptr= memkind_malloc(server.pmem_kind, size);
+-        /*update_nvm_stat_alloc(memkind_usable_size(server.pmem_kind, ptr));*/
++#else
++        PMEMoid nvm_oid;
++        //pmemobj_zalloc(server.pmem_kind, &nvm_oid,size,0);
++        //printf("allocate: nvm_oid.pool_uuid_lo=0x%lx, nvm_oid.off=0x%lx\n",nvm_oid.pool_uuid_lo, nvm_oid.off);
++        nvm_oid=reserve_wrapper(size,0);
++        ptr=nvm_oid.off+server.nvm_base;
++#endif     
++
++       /*update_nvm_stat_alloc(memkind_usable_size(server.pmem_kind, ptr));*/
+         if (ptr)
+             update_nvm_stat_alloc(jemk_malloc_usable_size(ptr));
+ #ifdef AEP_COW
+@@ -99,7 +118,16 @@ int nvm_free(void* ptr) {
+ #endif
+     
+     update_nvm_stat_free(size);
++#if 0    
+     memkind_free(server.pmem_kind, ptr);
++#else    
++    PMEMoid nvm_oid;
++    nvm_oid.pool_uuid_lo = server.pool_uuid_lo;
++    nvm_oid.off = (uint64_t)ptr - (uint64_t)server.nvm_base;
++    //printf("nvm_oid.pool_uuid_lo=0x%lx, nvm_oid.off=0x%lx\n",nvm_oid.pool_uuid_lo, nvm_oid.off);
++    //pmemobj_tx_free(nvm_oid);
++    pmemobj_free(&nvm_oid);
++#endif    
+     return 1;
+ }
+ 
+diff --git a/src/nvm.h b/src/nvm.h
+index b2c74fb..87b8772 100644
+--- a/src/nvm.h
++++ b/src/nvm.h
+@@ -35,6 +35,8 @@
+ #include <stdlib.h>
+ #include <memkind.h>
+ #include <memkind/internal/memkind_pmem.h>
++#include "libpmemobj.h"
++#include "obj.h"
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -46,6 +48,8 @@ size_t nvm_usable_size(void* ptr);
+ size_t nvm_get_used(void);
+ size_t nvm_get_alloc_count(void);
+ size_t nvm_get_rss(void);
++PMEMoid reserve_wrapper(size_t size, uint64_t type_num);
++void set_value_wrapper(uint64_t *ptr, uint64_t value); 
+ 
+ #ifdef HAVE_DEFRAG
+ void *zmalloc_nvm_no_tcache(size_t size);
+diff --git a/src/sds.c b/src/sds.c
+index ccd11bc..c8638cd 100644
+--- a/src/sds.c
++++ b/src/sds.c
+@@ -89,7 +89,7 @@ void s_memcpy(sds dest, const char * src, size_t len)
+     void *ptr= dest-hdrsize;
+     if(is_nvm_addr(ptr))
+     {
+-        pmem_flush(dest, len+hdrsize);
++        pmemobj_flush(server.pmem_kind,dest, len+hdrsize);
+         /*pmem_persist(dest, len+hdrsize);*/
+     }
+ #endif
+diff --git a/src/server.c b/src/server.c
+index c3dfeda..661ac47 100644
+--- a/src/server.c
++++ b/src/server.c
+@@ -1199,6 +1199,32 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
+     return 1000/server.hz;
+ }
+ 
++#ifdef USE_NVM
++void publishActions() {
++	if (server.cursor_action->counter == 0)
++		return;
++	struct actionNode *iterator;
++	struct actionNode *tmp;
++	iterator = server.head_action;
++	while (iterator && iterator->counter!=0) {
++		pmemobj_publish(server.pmem_kind, iterator->actions, iterator->counter);
++		iterator->counter = 0;
++		iterator = iterator->next;
++	}
++	iterator = server.head_action->next;
++	/*while (iterator) {
++		tmp = iterator;
++		iterator = iterator->next;
++		zfree(tmp);
++	}*/
++
++	server.cursor_action = server.head_action;
++	server.head_action->counter = 0;
++	//server.head_action->next = NULL;
++	pmemobj_drain(server.pmem_kind);
++}
++#endif
++
+ /* This function gets called every time Redis is entering the
+  * main loop of the event driven library, that is, before to sleep
+  * for ready file descriptors. */
+@@ -1243,7 +1269,8 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
+     /* Try to process pending commands for clients that were just unblocked. */
+     if (listLength(server.unblocked_clients))
+         processUnblockedClients();
+-
++    
++    publishActions();
+     /* Write the AOF buffer on disk */
+     flushAppendOnlyFile(0);
+ 
+@@ -1861,12 +1888,46 @@ void allocateNVMSpace(void) {
+     snprintf(filename, sizeof(filename) - 1, "redis-port-%d-%ldGB-AEP", server.port, size_in_GB);
+     filename[127] = '\0';
+ 
++#if 0
+     if (memkind_create_pmem(server.nvm_dir, filename, server.nvm_size, &(server.pmem_kind))) {
+         fprintf(stderr, "memkind_create_pmem failed");
+         exit(1);
+     }
+     server.nvm_base = memkind_base_addr(server.pmem_kind);
+     zmalloc_get_nvm_config(server.sdsmv_threshold,server.pmem_kind); 
++#else
++    /* Create new PMEM pool file.mode=666,read/write */
++    char fullname[strlen(server.nvm_dir) + strlen(filename) + 2];
++    sprintf(fullname, "%s/%s", server.nvm_dir, filename);
++    server.pmem_kind = pmemobj_create(fullname, PM_LAYOUT_NAME,server.nvm_size, 0666);
++	//Dennis: if the root object already exist, the pmboj_create will return null.
++    if (server.pmem_kind == NULL) {
++        /* Open the existing PMEM pool file. */
++        server.pmem_kind = pmemobj_open(fullname, PM_LAYOUT_NAME);
++        //server.pm_rootoid = POBJ_ROOT(server.pm_pool, struct redis_pmem_root);
++		//server.pm_reconstruct_required = true;
++
++        if (server.pmem_kind == NULL) {
++            serverLog(LL_WARNING,"Cannot init persistent memory poolset file "
++                "%s size %ld", fullname, server.nvm_size);
++            exit(1);
++        }
++    }
++
++    /* Get pool UUID from root object's OID. */
++    PMEMoid oid;
++    oid = pmemobj_root(server.pmem_kind, 1);
++    server.pool_uuid_lo = oid.pool_uuid_lo;
++    server.nvm_base=(char *)server.pmem_kind->addr;
++    zmalloc_get_nvm_config(server.sdsmv_threshold,server.pmem_kind);
++
++
++    server.head_action = zmalloc(sizeof(struct actionNode));
++    server.cursor_action = server.head_action;
++    server.head_action->counter = 0;
++    server.head_action->next = NULL;
++
++#endif
+ }
+ #endif
+ 
+diff --git a/src/server.h b/src/server.h
+index 431e872..f8d9c9f 100644
+--- a/src/server.h
++++ b/src/server.h
+@@ -76,7 +76,26 @@ typedef long long mstime_t; /* millisecond time type. */
+ #include "crc64.h"
+ 
+ #ifdef USE_NVM
++
++#if 0
+ #include <memkind.h>
++#else
++#include <stdbool.h>
++#include <sys/queue.h>
++#include "libpmemobj.h"
++#include "obj.h"
++#define PM_LAYOUT_NAME "store_db"
++
++POBJ_LAYOUT_BEGIN(store_db);
++POBJ_LAYOUT_END(store_db);
++#define POBJ_MAX_ACTIONS 60
++
++typedef struct actionNode {
++	struct pobj_action actions[POBJ_MAX_ACTIONS];
++	int counter;
++	struct actionNode *next;
++}actionNode;
++#endif
+ 
+ #define IS_EMBED_IN_ZIPLIST(p, zl) ((char*)(zl) < (char*)(p) && (char*)(p) < (char*)(zl) + ziplistBlobLen(zl))
+ #endif
+@@ -1244,7 +1263,14 @@ struct redisServer {
+     char* nvm_dir;
+     char* nvm_base;
+     size_t nvm_size;
++#if 0
+     struct memkind *pmem_kind;
++#else
++    PMEMobjpool *pmem_kind;           
++    uint64_t pool_uuid_lo;  
++    struct actionNode *head_action;	/* List of arrays of actions for reserve/publish*/
++    struct actionNode *cursor_action;	/* List of arrays of actions for reserve/publish*/
++#endif     
+     size_t sdsmv_threshold;
+ #endif
+ 
+diff --git a/src/zmalloc.c b/src/zmalloc.c
+index 4e926f6..f9de66a 100644
+--- a/src/zmalloc.c
++++ b/src/zmalloc.c
+@@ -119,13 +119,26 @@ void zmalloc_init_nvm(int (*_is_nvm_addr)(const void *),
+     use_nvm = 1;
+ }
+ static size_t  nvm_threshold=64;
++
++#if 0
+ static struct memkind *kindofpmem=NULL;
++#else
++static PMEMobjpool * kindofpmem=NULL;
++#endif
+ 
++#if 0
+ void zmalloc_get_nvm_config(size_t sdsmv_threshold, struct memkind *pmem_kind)
+ {
+    nvm_threshold=sdsmv_threshold;
+    kindofpmem=pmem_kind; 
+ }
++#else
++void zmalloc_get_nvm_config(size_t sdsmv_threshold, PMEMobjpool *pmem_kind)
++{
++   nvm_threshold=sdsmv_threshold;
++   kindofpmem=pmem_kind;
++}
++#endif
+ 
+ #endif
+ 
+diff --git a/src/zmalloc.h b/src/zmalloc.h
+index c68f56a..4503448 100644
+--- a/src/zmalloc.h
++++ b/src/zmalloc.h
+@@ -73,7 +73,16 @@
+ #endif
+ 
+ #ifdef USE_NVM
++
++#if 0
+ #include "memkind.h"
++#else
++#include <stdbool.h>
++#include <sys/queue.h>
++#include "obj.h"
++#include "libpmemobj.h"
++#endif
++
+ #endif
+ 
+ void *zmalloc(size_t size);
+@@ -103,7 +112,12 @@ void zmalloc_init_nvm(int (*_is_nvm_addr)(const void *),
+                       size_t (*_nvm_get_used)(void)
+                      );
+ 
++#if 0
+ void zmalloc_get_nvm_config(size_t sdsmv_threshold, struct memkind *pmem_kind);
++#else
++void zmalloc_get_nvm_config(size_t sdsmv_threshold, PMEMobjpool *pmem_kind);
++#endif
++
+ #endif
+ 
+ #ifdef HAVE_DEFRAG
+diff --git a/tests/bkc_scripts/client.sh b/tests/bkc_scripts/client.sh
+index 003a748..f77df43 100755
+--- a/tests/bkc_scripts/client.sh
++++ b/tests/bkc_scripts/client.sh
+@@ -50,17 +50,17 @@ Collect_Date()  ###generate ${workload}.csv in ${REDIS_PATH}/log/
+ #---------------------------check cpu configuration------------------------------------------
+ THREADS=`lscpu |grep "Thread(s) per core:"|awk -F ":" '{print $2'}|tr -d '[:space:]'`
+ CORES=`lscpu |grep "Core(s) per socket:"|awk -F ":" '{print $2'}|tr -d '[:space:]'`
+-if [ "$THREADS" == "1" ]; then
+-  echo "hyperthread is disabled, please enable it before doing the test."
+-  exit 1
+-fi
++#if [ "$THREADS" == "1" ]; then
++#  echo "hyperthread is disabled, please enable it before doing the test."
++#  exit 1
++#fi
+ 
+-LOCAL_THREAD=`lscpu |grep "NUMA node${BIND_SOCKET} CPU(s):"| awk '{print $(NF)}'|awk -F ',' '{print $1}'|awk -F '-' '{print $1}'`
+-if  [ $REDIS_NUM -gt $CORES ]; then
+-    echo "You're running too many Redis servers! Each Redis server need 2 CPU threads."
+-    exit 1
+-fi
+-REMOTE_THREAD=$(($LOCAL_THREAD + $CORES*2))
++#LOCAL_THREAD=`lscpu |grep "NUMA node${BIND_SOCKET} CPU(s):"| awk '{print $(NF)}'|awk -F ',' '{print $1}'|awk -F '-' '{print $1}'`
++#if  [ $REDIS_NUM -gt $CORES ]; then
++#    echo "You're running too many Redis servers! Each Redis server need 2 CPU threads."
++#    exit 1
++#fi
++#REMOTE_THREAD=$(($LOCAL_THREAD + $CORES*2))
+ 
+ #--------------------------start servers------------------------------------------------------
+ #for workload in lpush #zadd set
+@@ -74,6 +74,7 @@ do
+     do
+         port=$((9000 + ${instances}))
+         core_config=$((${LOCAL_THREAD}+${instances}-1)),$((${REMOTE_THREAD} + ${instances}-1))
++        core_config=$((27++ ${instances}))
+         echo -e  "\e[33mnumactl -m ${BIND_SOCKET} taskset -c $core_config ${REDIS_PATH}/src/redis-cli -p ${port} flushall >/dev/null &\e[0m"
+         numactl -m ${BIND_SOCKET} taskset -c $core_config ${REDIS_PATH}/src/redis-cli -p ${port} flushall >/dev/null &
+     done
+@@ -87,6 +88,8 @@ do
+             do
+                 port=$((9000 + ${instances}))
+                 core_config=$((${LOCAL_THREAD}+${instances}-1)),$((${REMOTE_THREAD} + ${instances}-1))
++                
++                core_config=$((27++ ${instances}))
+                 echo -e "\e[33m numactl -m ${BIND_SOCKET} taskset -c $core_config ${REDIS_PATH}/src/redis-benchmark-seq -p ${port} --seq ${REQ_NUM} -n ${REQ_NUM} -t ${Empty_Workloads[$key]} >/dev/null & \e[0m"
+                 numactl -m ${BIND_SOCKET} taskset -c $core_config ${REDIS_PATH}/src/redis-benchmark-seq -p ${port} --seq ${REQ_NUM} -n ${REQ_NUM} -t ${Empty_Workloads[$key]} >/dev/null &
+             done
+@@ -102,6 +105,8 @@ do
+     do
+         port=$((9000 + ${instances}))
+         core_config=$((${LOCAL_THREAD}+${instances}-1)),$((${REMOTE_THREAD} + ${instances}-1))
++        
++        core_config=$((27++ ${instances}))
+         echo -e  "\e[33m$workload starting redis client $instances\e[0m"
+         echo -e "\e[33m[$workload]=>numactl -m ${BIND_SOCKET} taskset -c $core_config ${REDIS_PATH}/src/redis-benchmark -p ${port} -r ${KEY_RANGE} -n ${REQ_NUM} -d $DATA_SIZE -t ${workload} $Field_Range > ${REDIS_PATH}/log/${REDIS_NUM}_$instances.log  &\e[0m"
+         numactl -m ${BIND_SOCKET} taskset -c $core_config ${REDIS_PATH}/src/redis-benchmark -p ${port} -r ${KEY_RANGE} -n ${REQ_NUM} -d $DATA_SIZE -t ${workload} ${Field_Range} > ${REDIS_PATH}/log/${workload}/${REDIS_NUM}_$instances.log  &
+diff --git a/tests/bkc_scripts/server_aep.sh b/tests/bkc_scripts/server_aep.sh
+index 2b7c6cf..f9a4628 100755
+--- a/tests/bkc_scripts/server_aep.sh
++++ b/tests/bkc_scripts/server_aep.sh
+@@ -23,34 +23,35 @@ done
+ echo -e "\e[33mZset_max_ziplist_entries is $Zset_max_ziplist_entries\e[0m"
+ echo -e "\e[33mZset_max_ziplist_value is $Zset_max_ziplist_value\e[0m"
+ 
+-if [ `ls /dev/pmem*|wc -l` -ne 2 ]; then
+-    echo "please check AD mode"
+-    exit 1
+-fi
++#if [ `ls /dev/pmem*|wc -l` -ne 2 ]; then
++#    echo "please check AD mode"
++#    exit 1
++#fi
+ if [ `mount|egrep "pmem0|pmem1"|wc -l` -ne 2 ]; then
+     mount -o dax /dev/pmem0 /mnt/pmem0
+-    mount -o dax /dev/pmem1 /mnt/pmem1
++    #mount -o dax /dev/pmem1 /mnt/pmem1
+ fi
+ #---------------------------check cpu configuration------------------------------------------
+ THREADS=`lscpu |grep "Thread(s) per core:"|awk -F ":" '{print $2'}|tr -d '[:space:]'`
+ CORES=`lscpu |grep "Core(s) per socket:"|awk -F ":" '{print $2'}|tr -d '[:space:]'`
+-if [ "$THREADS" == "1" ]; then
+-  echo "hyperthread is disabled, please enable it before doing the test."
+-  exit 1
+-fi
++#if [ "$THREADS" == "1" ]; then
++#  echo "hyperthread is disabled, please enable it before doing the test."
++#  exit 1
++#fi
+ 
+-LOCAL_THREAD=`lscpu |grep "NUMA node${BIND_SOCKET} CPU(s):"| awk '{print $(NF)}'|awk -F ',' '{print $1}'|awk -F '-' '{print $1}'`
+-if  [ $REDIS_NUM -gt $CORES ]; then
+-    echo "You're running too many Redis servers! Each Redis server need 2 CPU threads."
+-    exit 1
+-fi
+-REMOTE_THREAD=$(($LOCAL_THREAD + $CORES*2))
++#LOCAL_THREAD=`lscpu |grep "NUMA node${BIND_SOCKET} CPU(s):"| awk '{print $(NF)}'|awk -F ',' '{print $1}'|awk -F '-' '{print $1}'`
++#if  [ $REDIS_NUM -gt $CORES ]; then
++#    echo "You're running too many Redis servers! Each Redis server need 2 CPU threads."
++#    exit 1
++#fi
++#REMOTE_THREAD=$(($LOCAL_THREAD + $CORES*2))
+ 
+ #--------------------------start servers------------------------------------------------------
+ for (( instances=1; instances <= $REDIS_NUM; instances++ ))
+ do
+     port=$((9000 + ${instances}))
+     core_config=$((${LOCAL_THREAD}+${instances}-1)),$((${REMOTE_THREAD} + ${instances}-1))
++    core_config=${instances}
+ 
+     echo -e "\e[33mstarting redis server $instances\e[0m"
+     echo -e "\e[33mnumactl -m ${BIND_SOCKET} taskset -c $core_config  $REDIS_PATH/src/redis-server --appendonly no --port ${port} --nvm-maxcapacity 15 --nvm-dir /mnt/pmem${BIND_SOCKET}/ --nvm-threshold $NVM_THRESHOLD --dbfilename ${port}.dump --zset-max-ziplist-entries $Zset_max_ziplist_entries --zset-max-ziplist-value $Zset_max_ziplist_value\e[0m"
