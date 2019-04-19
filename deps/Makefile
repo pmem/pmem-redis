@@ -99,7 +99,7 @@ jemalloc: .make-prerequisites
 	
 .PHONY: jemalloc
 
-jemallocat: .make-prerequisites
+jemallocat: .make-prerequisites memkind
 	@printf '%b %b\n' $(MAKECOLOR)MAKE$(ENDCOLOR) $(BINCOLOR)$@$(ENDCOLOR)
 	cd jemallocat && make
 
