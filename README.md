@@ -58,6 +58,9 @@ USE_AOFGUARD | yes/no | Write Turbo with DCPMM option switch. W/O this option, t
 **Prerequisite**
 * Install `autoconf`, `automake`, `libtool`, `numactl-devel` and `tcl` on system
 
+If you want to build the Pmem-Redis for DCPMM, please install following packages as well:
+`libndctl-dev`, `libdaxctl-dev` and `libnuma-dev`
+
 **Compile example**:
 
 If you want to build the original opensource redis-4.0.0, run command:
